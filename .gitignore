@@ -1,0 +1,30 @@
+# Dependencies
+node_modules/
+
+# Python environments and caches
+.venv/
+face-service/.venv/
+__pycache__/
+*.py[cod]
+
+# LivePortrait clone, checkpoints, and model weights
+face-service/third_party/
+*.ckpt
+*.onnx
+*.pth
+*.safetensors
+
+# Runtime logs and generated output
+*.log
+face-service/liveportrait-server.*.log
+.uploads/
+
+# Local environment files
+.env
+.env.*
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

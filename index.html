@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Webcam Canvas App</title>
+    <link rel="stylesheet" href="./src/styles.css">
+    <script type="importmap">
+      {
+        "imports": {
+          "three": "./node_modules/three/build/three.module.js",
+          "three/addons/": "./node_modules/three/examples/jsm/"
+        }
+      }
+    </script>
+  </head>
+  <body>
+    <canvas id="preview" class="preview" width="640" height="480"></canvas>
+    <canvas id="three-canvas" class="preview" width="640" height="480" hidden></canvas>
+    <video id="camera" class="camera-pip" autoplay playsinline muted aria-label="Live webcam"></video>
+
+    <div class="hud">
+      <div class="hud-header">
+        <h1>Webcam Canvas Preview</h1>
+        <p id="status" class="status" data-tone="working">Starting camera...</p>
+      </div>
+      <div class="metrics" aria-live="polite">
+        <span id="fps">0.0 FPS</span>
+        <span id="scale">100% scale</span>
+        <span id="resolution">640 x 480</span>
+        <span id="tracking-state">pose: - / hands: 0</span>
+        <span id="ai-ws-state" data-state="closed">AI WS: closed</span>
+      </div>
+    </div>
+
+    <div id="sync-hud" class="sync-hud" hidden>
+      <strong>Sync</strong>
+      <span id="sync-mode">mode: -</span>
+      <span id="sync-delay">delay: -</span>
+      <span id="sync-latency">lat: -</span>
+      <span id="sync-offset">offset: -</span>
+      <span id="sync-interp">interp: -</span>
+    </div>
+
+    <div id="ai-bridge" class="ai-bridge" hidden>
+      <strong>MediaPipe -> LivePortrait</strong>
+      <canvas id="ai-bridge-preview" width="256" height="256"></canvas>
+      <span id="ai-bridge-source">source: -</span>
+      <span id="ai-bridge-state">state: closed</span>
+      <span id="ai-bridge-sent">sent: 0</span>
+      <span id="ai-bridge-received">received: 0</span>
+      <span id="ai-bridge-latency">latency: -</span>
+      <span id="ai-bridge-last">last: -</span>
+    </div>
+
+    <script type="module" src="./src/main.js"></script>
+  </body>
+</html>

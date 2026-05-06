@@ -1,0 +1,35 @@
+# Requires Python 3.10, 3.11, or 3.12. PyTorch does not yet ship wheels for
+# Python 3.13 / 3.14. Create the venv with one of those interpreters:
+#
+#     py -3.11 -m venv .venv
+#     .\.venv\Scripts\Activate.ps1
+#
+# For CUDA wheels of torch, install the matching index BEFORE this file:
+#     pip install --index-url https://download.pytorch.org/whl/cu121 torch torchvision
+# Then `pip install -r requirements.txt` will leave torch alone.
+
+# Core
+torch>=2.2,<2.5
+torchvision>=0.17,<0.20
+numpy>=1.24,<2.0
+opencv-python>=4.9
+pillow>=10.0
+
+# Server
+fastapi>=0.110
+uvicorn[standard]>=0.29
+websockets>=12.0
+
+# Used to fetch LivePortrait checkpoints on Windows (no bash required).
+huggingface_hub>=0.23
+
+# LivePortrait dependencies (mirroring its requirements.txt).
+imageio>=2.34
+imageio-ffmpeg>=0.4
+scikit-image>=0.22
+tqdm>=4.66
+omegaconf>=2.3
+einops>=0.7
+onnxruntime-gpu>=1.17 ; sys_platform != "darwin"
+onnxruntime>=1.17 ; sys_platform == "darwin"
+rich>=13.7
