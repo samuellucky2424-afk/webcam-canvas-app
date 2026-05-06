@@ -175,6 +175,9 @@ function attachAiBridge(client, { sourceImageUrl = null } = {}) {
           inferenceMs: serverInferenceMs,
           inferenceFps: serverInferenceFps
         });
+        client.setServerCapabilities?.({
+          compactPose: data.compact_pose === true
+        });
         source.textContent = `source: ${basename(data.source_path)} / ${data.device ?? "-"}`;
       })
       .catch(() => {
@@ -189,11 +192,12 @@ function attachAiBridge(client, { sourceImageUrl = null } = {}) {
     const stats = client.getStats();
     refreshHealth(stats);
     const mode = stats.ultraRealtime ? "ultra" : (stats.autoLowLatency ? "auto-low" : "rt");
-    state.textContent = `state: ${stats.status}${stats.awaitingResponse ? " / waiting" : ""} / q:${stats.queueDepth} / ${mode}`;
-    sent.textContent = `sent: ${stats.sentFrames} (${stats.sentFps.toFixed(1)}/s) / dropped: ${stats.droppedFrames}`;
+    const poseMode = stats.serverCompactPose ? "pose" : "img";
+    state.textContent = `state: ${stats.status}${stats.awaitingResponse ? " / waiting" : ""} / q:${stats.queueDepth} / ${mode}/${poseMode}`;
+    sent.textContent = `sent: ${stats.sentFrames} (${stats.sentFps.toFixed(1)}/s) / pose: ${stats.poseMessagesSent ?? 0} / dropped: ${stats.droppedFrames}`;
     received.textContent = `ai: ${stats.receivedFrames}/${stats.rawReceivedFrames} (${stats.receivedFps.toFixed(1)}/s)`;
     if (bitrate) {
-      bitrate.textContent = `net: up ${stats.uploadKBps.toFixed(1)} KB/s / down ${stats.downloadKBps.toFixed(1)} KB/s / avg ${Math.round(stats.avgUploadFrameBytes)}B:${Math.round(stats.avgDownloadFrameBytes)}B`;
+      bitrate.textContent = `net: ${poseMode} up ${stats.uploadKBps.toFixed(1)} KB/s / pose ${stats.poseMetaKBps.toFixed(1)} KB/s / down ${stats.downloadKBps.toFixed(1)} KB/s`;
     }
     if (latency) {
       const rtt = stats.websocketRttMs == null ? "-" : `${stats.websocketRttMs.toFixed(0)} ms`;
@@ -479,6 +483,8 @@ async function init() {
         poseRotationThreshold: AI_FACE_CONFIG.poseRotationThreshold,
         poseExpressionThreshold: AI_FACE_CONFIG.poseExpressionThreshold,
         maxPoseSilenceMs: AI_FACE_CONFIG.maxPoseSilenceMs,
+        compactPose: AI_FACE_CONFIG.compactPose,
+        compactPoseFps: AI_FACE_CONFIG.compactPoseFps,
         adaptiveQuality: AI_FACE_CONFIG.adaptiveQuality,
         highRttMs: AI_FACE_CONFIG.highRttMs,
         stableRttMs: AI_FACE_CONFIG.stableRttMs,

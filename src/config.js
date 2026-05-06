@@ -1,8 +1,7 @@
 const lowEndCpu = typeof navigator.hardwareConcurrency === "number" && navigator.hardwareConcurrency <= 4;
 
-const poseModelPath = lowEndCpu
-  ? "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task"
-  : "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_full/float16/1/pose_landmarker_full.task";
+const poseModelPath =
+  "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task";
 
 const handModelPath =
   "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task";
@@ -14,9 +13,9 @@ export const CAMERA_CONSTRAINTS = {
   audio: false,
   video: {
     facingMode: "user",
-    width: { ideal: lowEndCpu ? 640 : 960 },
-    height: { ideal: lowEndCpu ? 360 : 540 },
-    frameRate: { ideal: 24, max: 30 }
+    width: { ideal: 640 },
+    height: { ideal: 360 },
+    frameRate: { ideal: 30, max: 30 }
   }
 };
 
@@ -36,11 +35,11 @@ export const RENDER_CONFIG = {
 export const POSE_TRACKER_CONFIG = {
   downshiftStep: 2,
   maxPoses: 1,
-  maxTargetFps: lowEndCpu ? 14 : 18,
-  minTargetFps: 8,
+  maxTargetFps: lowEndCpu ? 24 : 30,
+  minTargetFps: 10,
   modelAssetPath: poseModelPath,
-  recoveryFps: 19,
-  targetFps: lowEndCpu ? 12 : 16,
+  recoveryFps: 24,
+  targetFps: lowEndCpu ? 18 : 30,
   upshiftStep: 1,
   wasmPath: "/node_modules/@mediapipe/tasks-vision/wasm",
   minPoseDetectionConfidence: 0.5,
@@ -54,7 +53,7 @@ export const POSE_TRACKER_CONFIG = {
     minTrackingConfidence: 0.5,
     // Run the hand tracker slightly slower than pose to keep the FPS floor
     // safe on lower-end machines. Pose runs at `targetFps` above.
-    targetFps: lowEndCpu ? 10 : 12
+    targetFps: lowEndCpu ? 12 : 15
   },
   face: null
 };
@@ -143,7 +142,7 @@ export const AI_FACE_CONFIG = {
   url: "wss://osts5obpvv4kv5-8765.proxy.runpod.net/ws",
   connectTimeoutMs: 3000,
   reconnectDelaysMs: [1000, 2000, 5000],
-  targetFps: lowEndCpu ? 10 : 12,
+  targetFps: lowEndCpu ? 1.5 : 2,
   jpegQuality: 0.45,
   driverSize: 160,
   outputSize: 160,
@@ -158,10 +157,12 @@ export const AI_FACE_CONFIG = {
   velocitySmoothingAlpha: 0.35,
   textureBlendMs: 90,
   adaptiveSend: true,
-  posePositionThreshold: 0.012,
-  poseRotationThreshold: 0.045,
-  poseExpressionThreshold: 0.08,
-  maxPoseSilenceMs: 900,
+  posePositionThreshold: 0.018,
+  poseRotationThreshold: 0.07,
+  poseExpressionThreshold: 0.12,
+  maxPoseSilenceMs: 2200,
+  compactPose: true,
+  compactPoseFps: 12,
   adaptiveQuality: true,
   highRttMs: 500,
   stableRttMs: 320,

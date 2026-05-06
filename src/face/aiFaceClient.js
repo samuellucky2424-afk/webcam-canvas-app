@@ -1,20 +1,19 @@
 /**
  * LivePortrait WebSocket client.
  *
- * Uploads downscaled driver frames (the user's webcam crop around the head)
- * as JPEG blobs to the Python face-service over a binary WebSocket, and
- * receives back AI-animated head frames as JPEGs which are decoded into a
- * reusable low-resolution canvas. That canvas is the `outputCanvas` consumed by the
- * sprite head renderer in `aiHeadRenderer.js`.
+ * Uploads low-frequency face texture refreshes to the Python face-service
+ * over binary WebSocket frames, while compact pose metadata can be sent as
+ * tiny JSON text frames when the server advertises support. The browser
+ * remains the primary realtime renderer.
  *
  * Design constraints honoured:
  *
- *  - One in flight. A new webcam frame is sent only after the previous
- *    LivePortrait response returns. Every other webcam frame is dropped.
- *  - Pre-allocated buffers. The driver scratch canvas and the output canvas
- *    are created once and resized only when realtime mode changes. No `new` allocations in the
- *    hot path apart from the unavoidable `Blob` and `ImageBitmap` returned
- *    by browser APIs (both are released).
+ *  - One image in flight. A new texture refresh is sent only after the
+ *    previous LivePortrait response returns. Local pose keeps animating
+ *    while the cloud texture is stale.
+ *  - Pre-allocated image buffers. The driver scratch canvas and output
+ *    canvas are created once and resized only when realtime mode changes;
+ *    compact pose JSON is intentionally tiny and only sent when supported.
  *  - Status fan-out. `connecting | open | closed` notifications
  *    let the composer flip back to the local default head atomically when
  *    the GPU side dies.
@@ -38,11 +37,20 @@ const CONNECT_TIMEOUT_MS = 3000;
 const RECONNECT_DELAYS_MS = [1000, 2000, 5000];
 const STATUSES = ["closed", "connecting", "open"];
 const MAX_BUFFERED_BYTES = 80_000;
-const MAX_SEND_FPS = 15;
+const MAX_IMAGE_SEND_FPS = 3;
+const POSE_JOINT_INDEX = {
+  nose: 0,
+  leftEye: 2,
+  rightEye: 5,
+  leftEar: 7,
+  rightEar: 8,
+  leftShoulder: 11,
+  rightShoulder: 12
+};
 
 export function createAiFaceClient({
   url = "ws://127.0.0.1:8765/ws",
-  targetFps = 12,
+  targetFps = 2,
   jpegQuality = DEFAULT_JPEG_QUALITY,
   driverSize = DEFAULT_DRIVER_SIZE,
   outputSize = DEFAULT_OUTPUT_SIZE,
@@ -56,6 +64,8 @@ export function createAiFaceClient({
   poseRotationThreshold = 0.045,
   poseExpressionThreshold = 0.08,
   maxPoseSilenceMs = 900,
+  compactPose = true,
+  compactPoseFps = 12,
   adaptiveQuality = true,
   highRttMs = 500,
   stableRttMs = 320,
@@ -100,6 +110,13 @@ export function createAiFaceClient({
   let skippedSocket = 0;
   let skippedBuffered = 0;
   let skippedPose = 0;
+  let poseMessagesSent = 0;
+  let poseBytesSent = 0;
+  let poseBytesSince = 0;
+  let poseMetaKBps = 0;
+  let lastPoseMetaSendT = 0;
+  let lastCompactPoseSignature = null;
+  let serverCompactPose = false;
   let sentSince = 0;
   let receivedSince = 0;
   let lastRateT = performance.now();
@@ -123,8 +140,9 @@ export function createAiFaceClient({
   let lastPoseSendT = 0;
   const listeners = new Set();
 
-  const cappedTargetFps = Math.max(1, Math.min(targetFps, MAX_SEND_FPS));
+  const cappedTargetFps = Math.max(1, Math.min(targetFps, MAX_IMAGE_SEND_FPS));
   const minIntervalMs = 1000 / cappedTargetFps;
+  const compactPoseIntervalMs = 1000 / Math.max(1, Math.min(compactPoseFps, 30));
   const replyTimeoutMs = Math.max(3000, Math.min(staleAfterMs || 3000, slowPreviewLatencyMs || 3000));
   const backoffDelays = Array.isArray(reconnectDelaysMs) && reconnectDelaysMs.length
     ? reconnectDelaysMs
@@ -349,14 +367,31 @@ export function createAiFaceClient({
     }
   }
 
+  function handleServerTextMessage(text) {
+    try {
+      const data = JSON.parse(text);
+      if (typeof data !== "object" || data === null) return;
+      if (typeof data.compactPose === "boolean" || typeof data.compact_pose === "boolean") {
+        setServerCapabilities({ compactPose: data.compactPose === true || data.compact_pose === true });
+      }
+    } catch (_) {
+      // Non-JSON server text is ignored; binary JPEG frames are the hot path.
+    }
+  }
+
   async function onMessage(ev) {
+    const data = ev.data;
+    if (typeof data === "string") {
+      handleServerTextMessage(data);
+      return;
+    }
+
     lastRecvT = performance.now();
     if (lastSendT) {
       lastRoundTripMs = lastRecvT - lastSendT;
     }
     awaitingResponse = false;
     updateInFlight();
-    const data = ev.data;
     if (!data) return;
     rawReceivedFrames += 1;
     const byteLength =
@@ -429,16 +464,19 @@ export function createAiFaceClient({
     receivedFps = (receivedSince * 1000) / elapsed;
     uploadKBps = (uploadedBytesSince / 1024) * (1000 / elapsed);
     downloadKBps = (downloadedBytesSince / 1024) * (1000 / elapsed);
+    poseMetaKBps = (poseBytesSince / 1024) * (1000 / elapsed);
     sentSince = 0;
     receivedSince = 0;
     uploadedBytesSince = 0;
     downloadedBytesSince = 0;
+    poseBytesSince = 0;
     lastRateT = now;
     console.info("aiFace rates", {
       sentFps: Number(sentFps.toFixed(1)),
       receivedFps: Number(receivedFps.toFixed(1)),
       uploadKBps: Number(uploadKBps.toFixed(1)),
       downloadKBps: Number(downloadKBps.toFixed(1)),
+      poseMetaKBps: Number(poseMetaKBps.toFixed(1)),
       avgUploadBytes: sentFrames ? Math.round(uploadedBytes / sentFrames) : 0,
       avgDownloadBytes: rawReceivedFrames ? Math.round(downloadedBytes / rawReceivedFrames) : 0,
       bufferedAmount: ws ? ws.bufferedAmount : null,
@@ -532,7 +570,99 @@ export function createAiFaceClient({
   }
 
   function getJoint(state, name) {
-    return state?.skeleton?.joints?.[name] ?? state?.overlay?.skeleton?.joints?.[name] ?? null;
+    const skeletonJoint = state?.skeleton?.joints?.[name] ?? state?.overlay?.skeleton?.joints?.[name];
+    if (skeletonJoint) return skeletonJoint;
+    const index = POSE_JOINT_INDEX[name];
+    return Number.isInteger(index) ? state?.overlay?.landmarks?.[index] ?? null : null;
+  }
+
+  function roundCompact(value, digits = 4) {
+    const n = Number(value);
+    if (!Number.isFinite(n)) return 0;
+    const factor = 10 ** digits;
+    return Math.round(n * factor) / factor;
+  }
+
+  function compactPoint(point) {
+    if (!point) return null;
+    const out = [
+      roundCompact(point.x),
+      roundCompact(point.y),
+      roundCompact(point.z ?? 0)
+    ];
+    if (Number.isFinite(point.visibility)) {
+      out.push(roundCompact(point.visibility, 3));
+    }
+    return out;
+  }
+
+  function compactJoints(state) {
+    const out = {};
+    for (const name of ["nose", "neck", "leftEye", "rightEye", "leftEar", "rightEar", "leftShoulder", "rightShoulder"]) {
+      const point = compactPoint(getJoint(state, name));
+      if (point) out[name] = point;
+    }
+    return out;
+  }
+
+  function compactFaceLandmarks(state) {
+    const landmarks = state?.overlay?.faces?.[0]?.landmarks;
+    if (!Array.isArray(landmarks) || landmarks.length === 0) return null;
+    const indices = [1, 10, 13, 14, 33, 61, 133, 152, 263, 291, 362];
+    const points = [];
+    for (const index of indices) {
+      const point = compactPoint(landmarks[index]);
+      if (point) points.push([index, ...point]);
+    }
+    return points.length ? points : null;
+  }
+
+  function buildCompactPoseMessage(state, now) {
+    const headPose = state?.headPose ?? {};
+    const expressions = state?.faceSignals?.expressionValues ?? {};
+    return {
+      type: "pose",
+      version: 1,
+      frameId: state?.frameId ?? -1,
+      t: Math.round(now),
+      hasFace: state?.hasFace === true,
+      head: {
+        yaw: roundCompact(headPose.yaw ?? expressions.yaw ?? 0),
+        pitch: roundCompact(headPose.pitch ?? expressions.pitch ?? 0),
+        roll: roundCompact(headPose.roll ?? expressions.roll ?? 0),
+        eyeOpen: roundCompact(headPose.eyeOpen ?? 1, 3),
+        mouthOpen: roundCompact(headPose.mouthOpen ?? state?.faceSignals?.mouthOpen ?? 0, 3),
+        smile: roundCompact(headPose.smile ?? expressions.smile ?? 0, 3),
+        confidence: roundCompact(headPose.confidence ?? 0, 3)
+      },
+      joints: compactJoints(state),
+      face: compactFaceLandmarks(state)
+    };
+  }
+
+  function maybeSendCompactPose(state, now, socket) {
+    if (!compactPose || !serverCompactPose || !socket || socket.readyState !== WebSocket.OPEN) return;
+    if (lastPoseMetaSendT && now - lastPoseMetaSendT < compactPoseIntervalMs) return;
+    if (socket.bufferedAmount > MAX_BUFFERED_BYTES) return;
+
+    const signature = poseSignature(state);
+    const changed = poseChangedEnough(lastCompactPoseSignature, signature);
+    if (!changed && lastPoseMetaSendT && now - lastPoseMetaSendT < maxPoseSilenceMs) return;
+
+    const message = JSON.stringify(buildCompactPoseMessage(state, now));
+    if (socket.bufferedAmount + message.length > MAX_BUFFERED_BYTES) return;
+
+    try {
+      socket.send(message);
+      poseMessagesSent += 1;
+      poseBytesSent += message.length;
+      poseBytesSince += message.length;
+      lastPoseMetaSendT = now;
+      lastCompactPoseSignature = signature;
+    } catch (error) {
+      lastError = error?.message || String(error);
+      console.error("error", error);
+    }
   }
 
   function poseSignature(state) {
@@ -737,6 +867,7 @@ export function createAiFaceClient({
       return;
     }
     const now = performance.now();
+    maybeSendCompactPose(state, now, ws);
     if (awaitingResponse) {
       handleReplyTimeout(now);
       skipFrame("awaitingResponse");
@@ -774,12 +905,13 @@ export function createAiFaceClient({
     // If we know where the face is in source (mirrored video) coords, crop
     // there. The `state.skeleton` has joints in source space (normalized
     // 0..1) — derive a head box from nose + ears when present.
-    const sk = state?.skeleton?.joints;
-    if (sk && sk.nose) {
-      cx = sk.nose.x * sw;
-      cy = sk.nose.y * sh;
+    const nose = getJoint(state, "nose");
+    if (nose) {
+      cx = nose.x * sw;
+      cy = nose.y * sh;
       // Heuristic head radius from eye spacing if available.
-      const lEye = sk.leftEye, rEye = sk.rightEye;
+      const lEye = getJoint(state, "leftEye");
+      const rEye = getJoint(state, "rightEye");
       if (lEye && rEye) {
         const eyeDx = (lEye.x - rEye.x) * sw;
         const eyeDy = (lEye.y - rEye.y) * sh;
@@ -812,6 +944,10 @@ export function createAiFaceClient({
   function setServerMetrics({ inferenceMs = null, inferenceFps = null } = {}) {
     if (Number.isFinite(inferenceMs)) serverInferenceMs = inferenceMs;
     if (Number.isFinite(inferenceFps)) serverInferenceFps = inferenceFps;
+  }
+
+  function setServerCapabilities({ compactPose: canCompactPose = false } = {}) {
+    serverCompactPose = compactPose && canCompactPose === true;
   }
 
   function setUltraRealtimeMode(on) {
@@ -879,16 +1015,22 @@ export function createAiFaceClient({
       inferenceTimeMs: serverInferenceMs,
       uploadKBps,
       downloadKBps,
+      poseMetaKBps,
       uploadedBytes,
       downloadedBytes,
+      poseMessagesSent,
+      poseBytesSent,
       avgUploadFrameBytes: sentFrames ? uploadedBytes / sentFrames : 0,
       avgDownloadFrameBytes: rawReceivedFrames ? downloadedBytes / rawReceivedFrames : 0,
+      avgPoseMessageBytes: poseMessagesSent ? poseBytesSent / poseMessagesSent : 0,
       driverSize: activeDriverSize,
       outputSize: activeOutputSize,
       jpegQuality: activeJpegQuality,
       targetFps: cappedTargetFps,
       ultraRealtime: ultraMode,
       autoLowLatency,
+      compactPoseEnabled: compactPose,
+      serverCompactPose,
       queueDepth: awaitingResponse ? 1 : 0,
       droppedFrames: skippedFrames,
       textureBlendActive,
@@ -915,6 +1057,7 @@ export function createAiFaceClient({
     getStatus,
     getStats,
     setServerMetrics,
+    setServerCapabilities,
     setUltraRealtimeMode,
     getUltraRealtimeMode,
     onStatusChange,

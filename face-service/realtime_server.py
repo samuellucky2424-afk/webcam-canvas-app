@@ -19,6 +19,7 @@ Environment knobs:
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import sys
@@ -143,6 +144,7 @@ class QueuedFrame:
     payload: bytes
     received_at: float
     sequence: int
+    pose: dict | None = None
 
 
 class LatestFrameSlot:
@@ -154,7 +156,7 @@ class LatestFrameSlot:
         self._lock = asyncio.Lock()
         self._sequence = 0
 
-    async def put(self, payload: bytes) -> bool:
+    async def put(self, payload: bytes, pose: dict | None = None) -> bool:
         async with self._lock:
             dropped_stale = self._latest is not None
             self._sequence += 1
@@ -162,6 +164,7 @@ class LatestFrameSlot:
                 payload=payload,
                 received_at=time.perf_counter(),
                 sequence=self._sequence,
+                pose=pose,
             )
             self._event.set()
             return dropped_stale
@@ -198,6 +201,9 @@ class RuntimeMetrics:
     send_errors: int = 0
     rx_bytes: int = 0
     tx_bytes: int = 0
+    pose_total: int = 0
+    pose_bytes: int = 0
+    last_pose_frame_id: int = -1
     queue_depth: int = 0
     last_latency_ms: float = 0.0
     last_inference_ms: float = 0.0
@@ -294,6 +300,7 @@ class RealtimeState:
             "ok": engine is not None,
             "route": "/ws",
             "bind": "0.0.0.0:8765",
+            "compact_pose": True,
             "device": str(engine.device) if engine else (cfg.device if cfg else None),
             "cuda_available": torch.cuda.is_available(),
             "cuda_device": torch.cuda.get_device_name(0) if torch.cuda.is_available() else None,
@@ -308,6 +315,9 @@ class RealtimeState:
             "tx_total": self.metrics.tx_total,
             "rx_bytes": self.metrics.rx_bytes,
             "tx_bytes": self.metrics.tx_bytes,
+            "pose_total": self.metrics.pose_total,
+            "pose_bytes": self.metrics.pose_bytes,
+            "last_pose_frame_id": self.metrics.last_pose_frame_id,
             "avg_rx_frame_bytes": round(self.metrics.rx_bytes / self.metrics.rx_total, 1)
             if self.metrics.rx_total
             else 0,
@@ -471,16 +481,43 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
     tx_since = 0
     rx_bytes_since = 0
     tx_bytes_since = 0
+    pose_since = 0
+    pose_bytes_since = 0
+    latest_pose: dict | None = None
     last_report = time.perf_counter()
 
     async def receiver() -> None:
-        nonlocal rx_since, rx_bytes_since
+        nonlocal rx_since, rx_bytes_since, pose_since, pose_bytes_since, latest_pose
         try:
             while not stop.is_set():
-                payload = await websocket.receive_bytes()
+                message = await websocket.receive()
+                if message.get("type") == "websocket.disconnect":
+                    raise WebSocketDisconnect
+
+                text = message.get("text")
+                if text is not None:
+                    text_bytes = len(text.encode("utf-8"))
+                    try:
+                        data = json.loads(text)
+                    except json.JSONDecodeError:
+                        logger.debug("Ignoring non-JSON websocket text message from %s.", client)
+                        continue
+                    if isinstance(data, dict) and data.get("type") == "pose":
+                        latest_pose = data
+                        state.metrics.pose_total += 1
+                        state.metrics.pose_bytes += text_bytes
+                        with suppress(TypeError, ValueError):
+                            state.metrics.last_pose_frame_id = int(data.get("frameId", -1))
+                        pose_since += 1
+                        pose_bytes_since += text_bytes
+                    else:
+                        logger.debug("Ignoring unsupported websocket text message from %s.", client)
+                    continue
+
+                payload = message.get("bytes")
                 if not payload:
                     continue
-                dropped = await slot.put(payload)
+                dropped = await slot.put(payload, latest_pose)
                 state.metrics.rx_total += 1
                 state.metrics.rx_bytes += len(payload)
                 rx_since += 1
@@ -550,7 +587,7 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
             last_send = now
 
     async def reporter() -> None:
-        nonlocal rx_since, tx_since, rx_bytes_since, tx_bytes_since, last_report
+        nonlocal rx_since, tx_since, rx_bytes_since, tx_bytes_since, pose_since, pose_bytes_since, last_report
         while not stop.is_set():
             await asyncio.sleep(1.0)
             now = time.perf_counter()
@@ -559,12 +596,15 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
             state.metrics.queue_depth = queue_depth
             logger.info(
                 "LivePortrait ws stats inference_fps=%.1f rx=%.1f/s tx=%.1f/s queue_depth=%d "
-                "up=%.1fKB/s down=%.1fKB/s latency=%.1fms inference=%.1fms stale_dropped=%d",
+                "up=%.1fKB/s pose=%.1f/s pose_up=%.1fKB/s down=%.1fKB/s "
+                "latency=%.1fms inference=%.1fms stale_dropped=%d",
                 state.metrics.inference_fps,
                 rx_since / elapsed,
                 tx_since / elapsed,
                 queue_depth,
                 (rx_bytes_since / 1024) / elapsed,
+                pose_since / elapsed,
+                (pose_bytes_since / 1024) / elapsed,
                 (tx_bytes_since / 1024) / elapsed,
                 state.metrics.last_latency_ms,
                 state.metrics.last_inference_ms,
@@ -574,6 +614,8 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
             tx_since = 0
             rx_bytes_since = 0
             tx_bytes_since = 0
+            pose_since = 0
+            pose_bytes_since = 0
             last_report = now
 
     tasks = [
