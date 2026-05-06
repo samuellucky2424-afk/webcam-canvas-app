@@ -9,9 +9,9 @@
  *
  * Design constraints honoured:
  *
- *  - Latest-wins. We never queue more than one in-flight upload; if the
- *    socket buffer is non-empty we drop the new frame.
- *  - Pre-allocated buffers. The driver scratch canvas (256×256) and the
+ *  - One in flight. A new webcam frame is sent only after the previous
+ *    LivePortrait response returns. Every other webcam frame is dropped.
+ *  - Pre-allocated buffers. The driver scratch canvas (192×192) and the
  *    output canvas (256×256) are created once. No `new` allocations in the
  *    hot path apart from the unavoidable `Blob` and `ImageBitmap` returned
  *    by browser APIs (both are released).
@@ -26,17 +26,18 @@
  * No retry storm: reconnection backs off through 1s, 2s, then 5s.
  */
 
-const DRIVER_SIZE = 256;
+const DRIVER_SIZE = 192;
 const OUTPUT_SIZE = 256;
 const CONNECT_TIMEOUT_MS = 3000;
 const RECONNECT_DELAYS_MS = [1000, 2000, 5000];
 const STATUSES = ["closed", "connecting", "open"];
-const MAX_BUFFERED_BYTES = 1_000_000;
+const MAX_BUFFERED_BYTES = 150_000;
+const MAX_SEND_FPS = 15;
 
 export function createAiFaceClient({
   url = "ws://127.0.0.1:8765/ws",
-  targetFps = 20,
-  jpegQuality = 0.7,
+  targetFps = 12,
+  jpegQuality = 0.6,
   reconnect = true,
   connectTimeoutMs = CONNECT_TIMEOUT_MS,
   reconnectDelaysMs = RECONNECT_DELAYS_MS,
@@ -49,9 +50,9 @@ export function createAiFaceClient({
   let ws = null;
   let status = "closed";
   let inFlight = false;
+  let awaitingResponse = false;
   let lastSendT = 0;
   let lastRecvT = 0;
-  let lastQueueT = 0;
   let lastSentFrameId = -1;
   let lastReceivedFrameId = -1;
   let sentFrames = 0;
@@ -59,22 +60,29 @@ export function createAiFaceClient({
   let receivedFrames = 0;
   let sentFps = 0;
   let receivedFps = 0;
-  let waitingForReply = false;
   let lastRoundTripMs = null;
+  let serverInferenceMs = null;
+  let serverInferenceFps = null;
   let lastError = "";
+  let skippedFrames = 0;
+  let skippedAwaitingResponse = 0;
+  let skippedThrottle = 0;
+  let skippedEncoding = 0;
+  let skippedSocket = 0;
+  let skippedBuffered = 0;
   let sentSince = 0;
   let receivedSince = 0;
   let lastRateT = performance.now();
   let encoding = false;
-  let queued = null;
   let reconnectAttempt = 0;
   let reconnectTimer = null;
   let connectTimer = null;
   let manualDisconnect = false;
   const listeners = new Set();
 
-  const minIntervalMs = 1000 / targetFps;
-  const replyTimeoutMs = Math.max(staleAfterMs || 0, 60000);
+  const cappedTargetFps = Math.max(1, Math.min(targetFps, MAX_SEND_FPS));
+  const minIntervalMs = 1000 / cappedTargetFps;
+  const replyTimeoutMs = Math.max(3000, Math.min(staleAfterMs || 3000, slowPreviewLatencyMs || 3000));
   const backoffDelays = Array.isArray(reconnectDelaysMs) && reconnectDelaysMs.length
     ? reconnectDelaysMs
     : RECONNECT_DELAYS_MS;
@@ -167,9 +175,8 @@ export function createAiFaceClient({
     });
     ws = null;
     inFlight = false;
-    waitingForReply = false;
+    awaitingResponse = false;
     encoding = false;
-    queued = null;
     if (syncBuffer) syncBuffer.clearPin();
     setStatus("closed");
     scheduleReconnect();
@@ -180,7 +187,7 @@ export function createAiFaceClient({
     lastError = ev?.message || "WebSocket error";
     console.error("error", ev);
     inFlight = false;
-    waitingForReply = false;
+    awaitingResponse = false;
     if (socket.readyState === WebSocket.CONNECTING || socket.readyState === WebSocket.OPEN) {
       closeSocket(socket);
     }
@@ -191,7 +198,8 @@ export function createAiFaceClient({
     if (lastSendT) {
       lastRoundTripMs = lastRecvT - lastSendT;
     }
-    waitingForReply = false;
+    awaitingResponse = false;
+    updateInFlight();
     const data = ev.data;
     if (!data) return;
     rawReceivedFrames += 1;
@@ -206,7 +214,6 @@ export function createAiFaceClient({
     try {
       const blob = data instanceof Blob ? data : new Blob([data], { type: "image/jpeg" });
       bitmap = await createImageBitmap(blob);
-      outputCtx.clearRect(0, 0, OUTPUT_SIZE, OUTPUT_SIZE);
       outputCtx.drawImage(bitmap, 0, 0, OUTPUT_SIZE, OUTPUT_SIZE);
       receivedFrames += 1;
       receivedSince += 1;
@@ -241,7 +248,9 @@ export function createAiFaceClient({
     console.info("aiFace rates", {
       sentFps: Number(sentFps.toFixed(1)),
       receivedFps: Number(receivedFps.toFixed(1)),
-      bufferedAmount: ws ? ws.bufferedAmount : null
+      bufferedAmount: ws ? ws.bufferedAmount : null,
+      activeInFlightCount: awaitingResponse ? 1 : 0,
+      skippedFrames
     });
   }
 
@@ -268,7 +277,7 @@ export function createAiFaceClient({
         });
         ws = null;
         inFlight = false;
-        waitingForReply = false;
+        awaitingResponse = false;
         if (syncBuffer) syncBuffer.clearPin();
         setStatus("closed");
         closeSocket(socket);
@@ -283,7 +292,7 @@ export function createAiFaceClient({
       clearConnectTimer();
       console.error("error", error);
       inFlight = false;
-      waitingForReply = false;
+      awaitingResponse = false;
       setStatus("closed");
       scheduleReconnect();
     }
@@ -297,7 +306,9 @@ export function createAiFaceClient({
       closeSocket(ws);
     }
     if (syncBuffer) syncBuffer.clearPin();
-    waitingForReply = false;
+    awaitingResponse = false;
+    encoding = false;
+    updateInFlight();
     setStatus("closed");
   }
 
@@ -306,58 +317,82 @@ export function createAiFaceClient({
   }
 
   function updateInFlight() {
-    inFlight = encoding || queued !== null;
+    inFlight = encoding || awaitingResponse;
   }
 
-  async function flushQueued() {
-    if (encoding) return;
-    if (!ws || ws.readyState !== 1) return;
-    if (!queued) return;
-    if (ws.bufferedAmount > MAX_BUFFERED_BYTES) {
-      queued = null;
-      updateInFlight();
-      return;
-    }
+  function skipFrame(reason) {
+    skippedFrames += 1;
+    if (reason === "awaitingResponse") skippedAwaitingResponse += 1;
+    else if (reason === "throttle") skippedThrottle += 1;
+    else if (reason === "encoding") skippedEncoding += 1;
+    else if (reason === "buffered") skippedBuffered += 1;
+    else skippedSocket += 1;
+    tickRates();
+  }
 
+  function handleReplyTimeout(now) {
+    if (!awaitingResponse || !lastSendT || now - lastSendT < replyTimeoutMs) return false;
+    lastError = `LivePortrait reply timed out after ${Math.round(now - lastSendT)} ms`;
+    console.error("error", new Error(lastError));
+    const socket = ws;
+    if (socket && (socket.readyState === WebSocket.CONNECTING || socket.readyState === WebSocket.OPEN)) {
+      closeSocket(socket);
+    }
+    return true;
+  }
+
+  async function sendCurrentFrame(source, state, socket) {
     encoding = true;
     updateInFlight();
-    const { source, state } = queued;
-    queued = null;
-
-    drawDriverCrop(source, state);
     const frameId = state?.frameId ?? -1;
 
     try {
+      drawDriverCrop(source, state);
       if (driverCanvas.toBlob) {
         const blob = await new Promise((resolve) => {
           driverCanvas.toBlob(resolve, "image/jpeg", jpegQuality);
         });
         if (!blob) return;
-        if (!ws || ws.readyState !== 1) return;
-        if (ws.bufferedAmount > MAX_BUFFERED_BYTES) return;
-        ws.send(blob);
+        if (socket !== ws || socket.readyState !== WebSocket.OPEN) return;
+        if (awaitingResponse) {
+          skipFrame("awaitingResponse");
+          return;
+        }
+        if (socket.bufferedAmount > MAX_BUFFERED_BYTES) {
+          skipFrame("buffered");
+          return;
+        }
+        socket.send(blob);
       } else {
         const dataUrl = driverCanvas.toDataURL("image/jpeg", jpegQuality);
         const bin = atob(dataUrl.split(",")[1]);
         const buf = new Uint8Array(bin.length);
         for (let i = 0; i < bin.length; i += 1) buf[i] = bin.charCodeAt(i);
-        ws.send(buf.buffer);
+        if (socket !== ws || socket.readyState !== WebSocket.OPEN) return;
+        if (awaitingResponse) {
+          skipFrame("awaitingResponse");
+          return;
+        }
+        if (socket.bufferedAmount > MAX_BUFFERED_BYTES) {
+          skipFrame("buffered");
+          return;
+        }
+        socket.send(buf.buffer);
       }
 
       lastSendT = performance.now();
       lastSentFrameId = frameId;
-      waitingForReply = true;
+      awaitingResponse = true;
+      updateInFlight();
       sentFrames += 1;
       sentSince += 1;
     } catch (error) {
+      lastError = error?.message || String(error);
       console.error("error", error);
     } finally {
       encoding = false;
       updateInFlight();
       tickRates();
-      if (queued) {
-        flushQueued();
-      }
     }
   }
 
@@ -370,23 +405,30 @@ export function createAiFaceClient({
    * has one, otherwise centres on the full frame.
    */
   function sendDriver(source, state) {
-    if (!ws || ws.readyState !== 1) return;
-    const now = performance.now();
-    if (waitingForReply) {
-      if (!lastSendT || now - lastSendT < replyTimeoutMs) return;
-      waitingForReply = false;
-      lastError = "LivePortrait reply timed out";
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+      skipFrame("socket");
+      return;
     }
-    const slowPreview = lastRoundTripMs != null && lastRoundTripMs > slowPreviewLatencyMs;
-    const activeMinIntervalMs = slowPreview
-      ? Math.max(minIntervalMs, slowPreviewIntervalMs)
-      : minIntervalMs;
-    if (now - lastQueueT < activeMinIntervalMs) return;
-    lastQueueT = now;
-    queued = { source, state };
-    updateInFlight();
+    const now = performance.now();
+    if (awaitingResponse) {
+      handleReplyTimeout(now);
+      skipFrame("awaitingResponse");
+      return;
+    }
+    if (encoding) {
+      skipFrame("encoding");
+      return;
+    }
+    if (lastSendT && now - lastSendT < minIntervalMs) {
+      skipFrame("throttle");
+      return;
+    }
+    if (ws.bufferedAmount > MAX_BUFFERED_BYTES) {
+      skipFrame("buffered");
+      return;
+    }
     tickRates();
-    flushQueued();
+    void sendCurrentFrame(source, state, ws);
   }
 
   function drawDriverCrop(source, state) {
@@ -436,6 +478,11 @@ export function createAiFaceClient({
     return () => listeners.delete(cb);
   }
 
+  function setServerMetrics({ inferenceMs = null, inferenceFps = null } = {}) {
+    if (Number.isFinite(inferenceMs)) serverInferenceMs = inferenceMs;
+    if (Number.isFinite(inferenceFps)) serverInferenceFps = inferenceFps;
+  }
+
   function getStatus() { return status; }
   function getStats() {
     const now = performance.now();
@@ -445,14 +492,29 @@ export function createAiFaceClient({
       sentFrames,
       rawReceivedFrames,
       receivedFrames,
-      inFlight: inFlight || waitingForReply,
-      waitingForReply,
-      pendingFrames: Math.max(0, sentFrames - receivedFrames),
+      inFlight,
+      awaitingResponse,
+      waitingForReply: awaitingResponse,
+      activeInFlightCount: awaitingResponse ? 1 : 0,
+      pendingFrames: awaitingResponse ? 1 : 0,
+      skippedFrames,
+      skippedAwaitingResponse,
+      skippedThrottle,
+      skippedEncoding,
+      skippedSocket,
+      skippedBuffered,
       sentFps,
       receivedFps,
       lastSentFrameId,
       lastReceivedFrameId,
       lastRoundTripMs,
+      websocketRttMs: lastRoundTripMs,
+      serverInferenceMs,
+      serverInferenceFps,
+      inferenceTimeMs: serverInferenceMs,
+      driverSize: DRIVER_SIZE,
+      jpegQuality,
+      targetFps: cappedTargetFps,
       lastError,
       slowPreview: lastRoundTripMs != null && lastRoundTripMs > slowPreviewLatencyMs,
       bufferedAmount: ws ? ws.bufferedAmount : null,
@@ -471,6 +533,7 @@ export function createAiFaceClient({
     isRealtime,
     getStatus,
     getStats,
+    setServerMetrics,
     onStatusChange,
     getLastReceivedFrameId,
     getOutputCanvas,

@@ -86,6 +86,8 @@ export function createAiHeadRenderer({
 
   const scratch = document.createElement("canvas");
   let scratchSize = 0;
+  let scratchFrameKey = -1;
+  let scratchColorKey = "";
 
   // Smoothed transform state.
   const s = {
@@ -107,6 +109,7 @@ export function createAiHeadRenderer({
     scratch.width = size;
     scratch.height = size;
     scratchSize = size;
+    scratchFrameKey = -1;
   }
 
   function clamp(v, lo, hi) { return v < lo ? lo : (v > hi ? hi : v); }
@@ -250,7 +253,18 @@ export function createAiHeadRenderer({
     c.rimShadowStrength = lerp(c.rimShadowStrength, rimShadowStrength, ca);
   }
 
-  function buildScratch(drawSize) {
+  function buildScratch(drawSize, frameKey) {
+    const colorKey = [
+      c.brightness.toFixed(3),
+      c.contrast.toFixed(3),
+      c.saturation.toFixed(3),
+      c.toneStrength.toFixed(3),
+      c.chinShadowStrength.toFixed(3)
+    ].join("|");
+    if (scratchFrameKey === frameKey && scratchColorKey === colorKey) return;
+    scratchFrameKey = frameKey;
+    scratchColorKey = colorKey;
+
     const sctx = scratch.getContext("2d");
     const W = drawSize;
     const H = Math.round(drawSize * ovalAspectY);
@@ -378,7 +392,8 @@ export function createAiHeadRenderer({
 
     const drawSize = Math.max(8, Math.round(s.radius * 2 * scaleBoost));
     ensureScratch(drawSize);
-    buildScratch(drawSize);
+    const outputFrameKey = client.getStats?.().receivedFrames ?? receivedFrameId ?? 0;
+    buildScratch(drawSize, outputFrameKey);
 
     // Yaw/pitch parallax.
     const xScale = clamp(Math.cos(s.yaw * yawWeight), minYawScale, 1);
@@ -417,6 +432,7 @@ export function createAiHeadRenderer({
     s.valid = false;
     s.cx = s.cy = s.radius = s.angle = null;
     s.yaw = 0; s.pitch = 0;
+    scratchFrameKey = -1;
     if (typeof fallback.reset === "function") fallback.reset();
   }
 
@@ -440,6 +456,7 @@ export function createAiHeadRenderer({
     if (Number.isFinite(updates.chinShadowStrength)) chinShadowStrength = updates.chinShadowStrength;
     if (Number.isFinite(updates.rimShadowStrength)) rimShadowStrength = updates.rimShadowStrength;
     if (typeof updates.toneTint === "string") toneTint = updates.toneTint;
+    scratchFrameKey = -1;
   }
 
   function setDebug(on) { debugOn = !!on; }

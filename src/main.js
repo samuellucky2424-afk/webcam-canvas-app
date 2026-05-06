@@ -116,6 +116,8 @@ function attachAiBridge(client, { sourceImageUrl = null } = {}) {
   let sourcePreviewDrawn = false;
   let nextHealthCheck = 0;
   let healthInFlight = false;
+  let serverInferenceMs = null;
+  let serverInferenceFps = null;
 
   root.hidden = false;
 
@@ -159,10 +161,13 @@ function attachAiBridge(client, { sourceImageUrl = null } = {}) {
     fetch(url, { cache: "no-store" })
       .then((r) => (r.ok ? r.json() : Promise.reject(new Error(`health ${r.status}`))))
       .then((data) => {
+        serverInferenceMs = Number(data.last_inference_ms ?? NaN);
+        serverInferenceFps = Number(data.inference_fps ?? NaN);
+        client.setServerMetrics?.({
+          inferenceMs: serverInferenceMs,
+          inferenceFps: serverInferenceFps
+        });
         source.textContent = `source: ${basename(data.source_path)} / ${data.device ?? "-"}`;
-        if (latency) {
-          latency.textContent = `server: ${Number(data.last_inference_ms ?? 0).toFixed(0)} ms`;
-        }
       })
       .catch(() => {
         source.textContent = "source: health unavailable";
@@ -175,11 +180,14 @@ function attachAiBridge(client, { sourceImageUrl = null } = {}) {
   setInterval(() => {
     const stats = client.getStats();
     refreshHealth(stats);
-    state.textContent = `state: ${stats.status}${stats.waitingForReply ? " / waiting" : ""}`;
-    sent.textContent = `sent: ${stats.sentFrames} (${stats.sentFps.toFixed(1)}/s)`;
+    state.textContent = `state: ${stats.status}${stats.awaitingResponse ? " / waiting" : ""} / in-flight: ${stats.activeInFlightCount}`;
+    sent.textContent = `sent: ${stats.sentFrames} (${stats.sentFps.toFixed(1)}/s) / skipped: ${stats.skippedFrames}`;
     received.textContent = `received: ${stats.receivedFrames}/${stats.rawReceivedFrames} (${stats.receivedFps.toFixed(1)}/s)`;
-    if (latency && stats.lastRoundTripMs != null) {
-      latency.textContent = `latency: ${(stats.lastRoundTripMs / 1000).toFixed(1)}s`;
+    if (latency) {
+      const rtt = stats.websocketRttMs == null ? "-" : `${stats.websocketRttMs.toFixed(0)} ms`;
+      const infer = Number.isFinite(serverInferenceMs) ? `${serverInferenceMs.toFixed(0)} ms` : "-";
+      const inferFps = Number.isFinite(serverInferenceFps) ? ` @ ${serverInferenceFps.toFixed(1)}/s` : "";
+      latency.textContent = `rtt: ${rtt} / infer: ${infer}${inferFps}`;
     }
     last.textContent = `last: ${
       stats.msSinceReceive == null ? "-" : `${(stats.msSinceReceive / 1000).toFixed(1)}s ago`
