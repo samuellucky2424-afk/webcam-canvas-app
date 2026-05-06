@@ -13,8 +13,9 @@
  *
  * Pipeline stages:
  *
- *   1. Anchor / scale / rotation (see `smoothFrame`) with shortest-arc
- *      smoothing on every animated quantity to eliminate jitter.
+ *   1. Local pose drives anchor / scale / rotation immediately. Cloud AI
+ *      frames are treated as texture refreshes, not motion timing.
+ *      Velocity extrapolation predicts the next local head transform.
  *   2. Color match — `ctx.filter` applies brightness / contrast /
  *      saturation to the AI portrait so it blends with the avatar's
  *      palette. The strengths are smoothed across frames so subtle
@@ -70,6 +71,11 @@ export function createAiHeadRenderer({
   pitchWeight = 0.6,
   minYawScale = 0.78,
   minPitchScale = 0.82,
+  latencyCompensation = true,
+  predictionMs = 90,
+  maxPredictionMs = 140,
+  motionSmoothingAlpha = 0.55,
+  velocitySmoothingAlpha = 0.35,
   // Anti-flicker: how strongly per-frame color adjustments are smoothed
   // toward their target values (0 = frozen at first frame, 1 = no
   // smoothing). 0.08 keeps subtle JPEG flicker off the face without
@@ -94,6 +100,16 @@ export function createAiHeadRenderer({
     cx: null, cy: null, radius: null, angle: null,
     yaw: 0, pitch: 0, valid: false
   };
+  const motion = {
+    lastT: 0,
+    last: null,
+    vx: 0,
+    vy: 0,
+    vr: 0,
+    va: 0,
+    vyaw: 0,
+    vpitch: 0
+  };
   // Smoothed color state — primed at the configured targets so the very
   // first frame already looks right.
   const c = {
@@ -113,6 +129,13 @@ export function createAiHeadRenderer({
   }
 
   function clamp(v, lo, hi) { return v < lo ? lo : (v > hi ? hi : v); }
+
+  function angleDelta(from, to) {
+    let d = to - from;
+    while (d > Math.PI) d -= TWO_PI;
+    while (d < -Math.PI) d += TWO_PI;
+    return d;
+  }
 
   function clampStep(prev, next, maxStep) {
     if (prev === null || !Number.isFinite(prev)) return next;
@@ -138,10 +161,7 @@ export function createAiHeadRenderer({
   }
   function lerpAngle(prev, cur, alpha) {
     if (prev === null || !Number.isFinite(prev)) return cur;
-    let d = cur - prev;
-    while (d > Math.PI) d -= TWO_PI;
-    while (d < -Math.PI) d += TWO_PI;
-    return prev + d * alpha;
+    return prev + angleDelta(prev, cur) * alpha;
   }
 
   function midpoint(a, b) {
@@ -175,10 +195,42 @@ export function createAiHeadRenderer({
     return { x: prev.x + dx * k, y: prev.y + dy * k };
   }
 
+  function predictTarget(target, now) {
+    if (!latencyCompensation) return target;
+
+    if (motion.last && motion.lastT) {
+      const dt = clamp((now - motion.lastT) / 1000, 1 / 120, 0.15);
+      const a = clamp(velocitySmoothingAlpha, 0.05, 0.9);
+      motion.vx = lerp(motion.vx, (target.cx - motion.last.cx) / dt, a);
+      motion.vy = lerp(motion.vy, (target.cy - motion.last.cy) / dt, a);
+      motion.vr = lerp(motion.vr, (target.radius - motion.last.radius) / dt, a);
+      motion.va = lerp(motion.va, angleDelta(motion.last.angle, target.angle) / dt, a);
+      motion.vyaw = lerp(motion.vyaw, (target.yaw - motion.last.yaw) / dt, a);
+      motion.vpitch = lerp(motion.vpitch, (target.pitch - motion.last.pitch) / dt, a);
+    }
+
+    motion.last = { ...target };
+    motion.lastT = now;
+
+    const lead = clamp(predictionMs, 0, maxPredictionMs) / 1000;
+    const maxShift = Math.max(2, target.radius * 0.35);
+    const dx = clamp(motion.vx * lead, -maxShift, maxShift);
+    const dy = clamp(motion.vy * lead, -maxShift, maxShift);
+    return {
+      cx: target.cx + dx,
+      cy: target.cy + dy,
+      radius: clamp(target.radius + motion.vr * lead, target.radius * 0.75, target.radius * 1.25),
+      angle: target.angle + clamp(motion.va * lead, -0.35, 0.35),
+      yaw: clamp(target.yaw + motion.vyaw * lead, -1.25, 1.25),
+      pitch: clamp(target.pitch + motion.vpitch * lead, -1.25, 1.25)
+    };
+  }
+
   function smoothFrame(frame) {
-    const posA = clamp(smoothingAlpha + 0.05, 0.02, 0.5);
-    const scaleA = clamp(smoothingAlpha - 0.05, 0.02, 0.5);
-    const rotA = clamp(smoothingAlpha, 0.02, 0.5);
+    const motionA = clamp(latencyCompensation ? motionSmoothingAlpha : smoothingAlpha, 0.02, 0.85);
+    const posA = clamp(latencyCompensation ? motionA : smoothingAlpha + 0.05, 0.02, 0.85);
+    const scaleA = clamp(latencyCompensation ? motionA * 0.78 : smoothingAlpha - 0.05, 0.02, 0.65);
+    const rotA = clamp(latencyCompensation ? motionA * 0.92 : smoothingAlpha, 0.02, 0.8);
 
     const faceInfo = pickFaceAnchor(frame.faceLandmarks);
     const confidence = clamp(frame.headPose?.confidence ?? 0, 0, 1);
@@ -196,15 +248,15 @@ export function createAiHeadRenderer({
       };
     }
 
-    const maxPosStep = Math.max(2, (s.radius ?? frame.radius ?? 24) * 0.25);
-    const clampedAnchor = clampPointStep(
+    let maxPosStep = Math.max(2, (s.radius ?? frame.radius ?? 24) * 0.25);
+    let clampedAnchor = clampPointStep(
       s.cx == null || s.cy == null ? null : { x: s.cx, y: s.cy },
       currentAnchor,
       maxPosStep
     );
 
-    const yaw = clamp(frame.headPose?.yaw ?? 0, -1.2, 1.2);
-    const pitch = clamp(frame.headPose?.pitch ?? 0, -1.2, 1.2);
+    let yaw = clamp(frame.headPose?.yaw ?? 0, -1.2, 1.2);
+    let pitch = clamp(frame.headPose?.pitch ?? 0, -1.2, 1.2);
     const roll = clamp(frame.headPose?.roll ?? 0, -1.2, 1.2);
 
     let targetRadius = frame.radius;
@@ -223,14 +275,34 @@ export function createAiHeadRenderer({
       }
     }
 
-    const maxRadiusStep = Math.max(1, (s.radius ?? targetRadius ?? 24) * 0.18);
+    const targetAngle = (frame.headAngle ?? 0) + roll;
+    const predicted = predictTarget({
+      cx: currentAnchor.x,
+      cy: currentAnchor.y,
+      radius: targetRadius,
+      angle: targetAngle,
+      yaw,
+      pitch
+    }, performance.now());
+
+    currentAnchor = { x: predicted.cx, y: predicted.cy };
+    targetRadius = predicted.radius;
+    yaw = predicted.yaw;
+    pitch = predicted.pitch;
+    maxPosStep = Math.max(2, (s.radius ?? targetRadius ?? 24) * (latencyCompensation ? 0.55 : 0.25));
+    clampedAnchor = clampPointStep(
+      s.cx == null || s.cy == null ? null : { x: s.cx, y: s.cy },
+      currentAnchor,
+      maxPosStep
+    );
+
+    const maxRadiusStep = Math.max(1, (s.radius ?? targetRadius ?? 24) * (latencyCompensation ? 0.35 : 0.18));
     const radiusStep = clampStep(s.radius, targetRadius, maxRadiusStep);
 
-    const targetAngle = (frame.headAngle ?? 0) + roll;
-    const maxAngleStep = 0.35;
-    const angleStep = clampAngleStep(s.angle, targetAngle, maxAngleStep);
+    const maxAngleStep = latencyCompensation ? 0.65 : 0.35;
+    const angleStep = clampAngleStep(s.angle, predicted.angle, maxAngleStep);
 
-    const maxAxisStep = 0.35;
+    const maxAxisStep = latencyCompensation ? 0.7 : 0.35;
     const yawStep = clampStep(s.yaw, yaw, maxAxisStep);
     const pitchStep = clampStep(s.pitch, pitch, maxAxisStep);
 
@@ -363,6 +435,53 @@ export function createAiHeadRenderer({
     ctx.restore();
   }
 
+  function drawWarpedTexture(ctx, image, halfW, halfH) {
+    const width = halfW * 2;
+    const height = halfH * 2;
+    const yawN = clamp(s.yaw * yawWeight, -1, 1);
+    const pitchN = clamp(s.pitch * pitchWeight, -1, 1);
+    const xScale = clamp(Math.cos(s.yaw * yawWeight), minYawScale, 1);
+    const yScale = clamp(Math.cos(s.pitch * pitchWeight), minPitchScale, 1);
+    const skewX = Math.sin(yawN) * 0.12;
+    const skewY = -Math.sin(pitchN) * 0.08;
+    const rows = latencyCompensation ? 18 : 1;
+
+    ctx.save();
+    ctx.scale(xScale, yScale);
+    ctx.transform(1, skewY, skewX, 1, 0, 0);
+
+    if (rows <= 1) {
+      ctx.drawImage(image, -halfW, -halfH, width, height);
+      ctx.restore();
+      return;
+    }
+
+    const srcH = image.height || height;
+    const srcW = image.width || width;
+    for (let i = 0; i < rows; i += 1) {
+      const v0 = i / rows;
+      const v1 = (i + 1) / rows;
+      const mid = (v0 + v1) * 0.5;
+      const y = -halfH + v0 * height;
+      const rowH = (v1 - v0) * height + 1;
+      const perspectiveScale = 1 + pitchN * (mid - 0.5) * 0.22;
+      const rowW = width * perspectiveScale;
+      const rowX = -rowW * 0.5 + yawN * (mid - 0.5) * halfW * 0.16;
+      ctx.drawImage(
+        image,
+        0,
+        v0 * srcH,
+        srcW,
+        Math.max(1, (v1 - v0) * srcH),
+        rowX,
+        y,
+        rowW,
+        rowH
+      );
+    }
+    ctx.restore();
+  }
+
   function draw(ctx, frame) {
     if (!client.isReady()) {
       s.valid = false;
@@ -372,16 +491,6 @@ export function createAiHeadRenderer({
     }
 
     const receivedFrameId = client.getLastReceivedFrameId?.();
-    if (
-      frame.frameId != null &&
-      receivedFrameId != null &&
-      receivedFrameId > 0 &&
-      Math.abs(receivedFrameId - frame.frameId) > 2
-    ) {
-      fallback.draw(ctx, frame);
-      return;
-    }
-
     const ai = client.getOutputCanvas();
     if (!ai || !ai.width) {
       fallback.draw(ctx, frame);
@@ -392,12 +501,12 @@ export function createAiHeadRenderer({
 
     const drawSize = Math.max(8, Math.round(s.radius * 2 * scaleBoost));
     ensureScratch(drawSize);
-    const outputFrameKey = client.getStats?.().receivedFrames ?? receivedFrameId ?? 0;
+    const clientStats = client.getStats?.();
+    const outputFrameKey = clientStats?.textureBlendActive
+      ? `${clientStats.textureFrameVersion}:${Math.floor(performance.now() / 16)}`
+      : clientStats?.textureFrameVersion ?? receivedFrameId ?? 0;
     buildScratch(drawSize, outputFrameKey);
 
-    // Yaw/pitch parallax.
-    const xScale = clamp(Math.cos(s.yaw * yawWeight), minYawScale, 1);
-    const yScale = clamp(Math.cos(s.pitch * pitchWeight), minPitchScale, 1);
     const slideX = Math.sin(s.yaw * yawWeight) * s.radius * 0.12;
     const slideY = Math.sin(s.pitch * pitchWeight) * s.radius * 0.10;
 
@@ -409,7 +518,7 @@ export function createAiHeadRenderer({
 
     const halfW = drawSize * 0.5;
     const halfH = (drawSize * ovalAspectY) * 0.5;
-    ctx.drawImage(scratch, -halfW, -halfH, drawSize, drawSize * ovalAspectY);
+    drawWarpedTexture(ctx, scratch, halfW, halfH);
 
     // Rim shadow grounds the AI portrait against the body silhouette.
     if (c.rimShadowStrength > 0.001) {
@@ -432,6 +541,9 @@ export function createAiHeadRenderer({
     s.valid = false;
     s.cx = s.cy = s.radius = s.angle = null;
     s.yaw = 0; s.pitch = 0;
+    motion.lastT = 0;
+    motion.last = null;
+    motion.vx = motion.vy = motion.vr = motion.va = motion.vyaw = motion.vpitch = 0;
     scratchFrameKey = -1;
     if (typeof fallback.reset === "function") fallback.reset();
   }

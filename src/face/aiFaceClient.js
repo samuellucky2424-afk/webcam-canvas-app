@@ -33,6 +33,7 @@ const ULTRA_OUTPUT_SIZE = 128;
 const DEFAULT_JPEG_QUALITY = 0.45;
 const ULTRA_JPEG_QUALITY = 0.4;
 const MAX_JPEG_QUALITY = 0.5;
+const DEFAULT_TEXTURE_BLEND_MS = 90;
 const CONNECT_TIMEOUT_MS = 3000;
 const RECONNECT_DELAYS_MS = [1000, 2000, 5000];
 const STATUSES = ["closed", "connecting", "open"];
@@ -49,6 +50,7 @@ export function createAiFaceClient({
   ultraDriverSize = ULTRA_DRIVER_SIZE,
   ultraOutputSize = ULTRA_OUTPUT_SIZE,
   ultraJpegQuality = ULTRA_JPEG_QUALITY,
+  textureBlendMs = DEFAULT_TEXTURE_BLEND_MS,
   reconnect = true,
   connectTimeoutMs = CONNECT_TIMEOUT_MS,
   reconnectDelaysMs = RECONNECT_DELAYS_MS,
@@ -100,6 +102,9 @@ export function createAiFaceClient({
   let activeOutputSize = 0;
   let activeJpegQuality = 0;
   let activeUrl = url;
+  let textureBlendStartT = 0;
+  let textureBlendActive = false;
+  let textureFrameVersion = 0;
   const listeners = new Set();
 
   const cappedTargetFps = Math.max(1, Math.min(targetFps, MAX_SEND_FPS));
@@ -144,6 +149,16 @@ export function createAiFaceClient({
   outputCanvas.height = activeOutputSize;
   const outputCtx = outputCanvas.getContext("2d", { alpha: true });
 
+  const currentTextureCanvas = document.createElement("canvas");
+  currentTextureCanvas.width = activeOutputSize;
+  currentTextureCanvas.height = activeOutputSize;
+  const currentTextureCtx = currentTextureCanvas.getContext("2d", { alpha: true });
+
+  const previousTextureCanvas = document.createElement("canvas");
+  previousTextureCanvas.width = activeOutputSize;
+  previousTextureCanvas.height = activeOutputSize;
+  const previousTextureCtx = previousTextureCanvas.getContext("2d", { alpha: true });
+
   // ---------------- helpers ----------------
   function configureCanvasState() {
     if (driverCtx) {
@@ -154,20 +169,60 @@ export function createAiFaceClient({
       outputCtx.imageSmoothingEnabled = true;
       outputCtx.imageSmoothingQuality = "low";
     }
+    if (currentTextureCtx) {
+      currentTextureCtx.imageSmoothingEnabled = true;
+      currentTextureCtx.imageSmoothingQuality = "low";
+    }
+    if (previousTextureCtx) {
+      previousTextureCtx.imageSmoothingEnabled = true;
+      previousTextureCtx.imageSmoothingQuality = "low";
+    }
   }
 
   configureCanvasState();
 
+  function resizeCanvas(canvas, width, height) {
+    if (canvas.width === width && canvas.height === height) return false;
+    canvas.width = width;
+    canvas.height = height;
+    return true;
+  }
+
   function resizePayloadCanvases() {
-    if (driverCanvas.width !== activeDriverSize || driverCanvas.height !== activeDriverSize) {
-      driverCanvas.width = activeDriverSize;
-      driverCanvas.height = activeDriverSize;
-    }
-    if (outputCanvas.width !== activeOutputSize || outputCanvas.height !== activeOutputSize) {
-      outputCanvas.width = activeOutputSize;
-      outputCanvas.height = activeOutputSize;
+    resizeCanvas(driverCanvas, activeDriverSize, activeDriverSize);
+    const outputChanged = resizeCanvas(outputCanvas, activeOutputSize, activeOutputSize);
+    resizeCanvas(currentTextureCanvas, activeOutputSize, activeOutputSize);
+    resizeCanvas(previousTextureCanvas, activeOutputSize, activeOutputSize);
+    if (outputChanged) {
+      textureBlendActive = false;
+      textureFrameVersion = 0;
     }
     configureCanvasState();
+  }
+
+  function easeBlend(t) {
+    const x = Math.max(0, Math.min(1, t));
+    return x * x * (3 - 2 * x);
+  }
+
+  function updateTextureBlend(now = performance.now()) {
+    if (!textureBlendActive) return;
+    const duration = Math.max(0, textureBlendMs);
+    const t = duration > 0 ? (now - textureBlendStartT) / duration : 1;
+    if (t >= 1) {
+      outputCtx.globalAlpha = 1;
+      outputCtx.clearRect(0, 0, activeOutputSize, activeOutputSize);
+      outputCtx.drawImage(currentTextureCanvas, 0, 0, activeOutputSize, activeOutputSize);
+      textureBlendActive = false;
+      return;
+    }
+    const alpha = easeBlend(t);
+    outputCtx.globalAlpha = 1;
+    outputCtx.clearRect(0, 0, activeOutputSize, activeOutputSize);
+    outputCtx.drawImage(previousTextureCanvas, 0, 0, activeOutputSize, activeOutputSize);
+    outputCtx.globalAlpha = alpha;
+    outputCtx.drawImage(currentTextureCanvas, 0, 0, activeOutputSize, activeOutputSize);
+    outputCtx.globalAlpha = 1;
   }
 
   function buildWsUrl() {
@@ -299,6 +354,12 @@ export function createAiFaceClient({
     }
     let bitmap = null;
     try {
+      const hadTexture = receivedFrames > 0 || textureFrameVersion > 0;
+      if (hadTexture) {
+        updateTextureBlend();
+        previousTextureCtx.clearRect(0, 0, activeOutputSize, activeOutputSize);
+        previousTextureCtx.drawImage(outputCanvas, 0, 0, activeOutputSize, activeOutputSize);
+      }
       const blob = data instanceof Blob ? data : new Blob([data], { type: "image/jpeg" });
       try {
         bitmap = await createImageBitmap(blob, {
@@ -309,7 +370,18 @@ export function createAiFaceClient({
       } catch (_) {
         bitmap = await createImageBitmap(blob);
       }
-      outputCtx.drawImage(bitmap, 0, 0, activeOutputSize, activeOutputSize);
+      currentTextureCtx.clearRect(0, 0, activeOutputSize, activeOutputSize);
+      currentTextureCtx.drawImage(bitmap, 0, 0, activeOutputSize, activeOutputSize);
+      textureFrameVersion += 1;
+      if (hadTexture && textureBlendMs > 0) {
+        textureBlendStartT = performance.now();
+        textureBlendActive = true;
+        updateTextureBlend(textureBlendStartT);
+      } else {
+        textureBlendActive = false;
+        outputCtx.clearRect(0, 0, activeOutputSize, activeOutputSize);
+        outputCtx.drawImage(currentTextureCanvas, 0, 0, activeOutputSize, activeOutputSize);
+      }
       receivedFrames += 1;
       receivedSince += 1;
       lastError = "";
@@ -605,6 +677,7 @@ export function createAiFaceClient({
     resizePayloadCanvases();
     awaitingResponse = false;
     encoding = false;
+    textureBlendActive = false;
     lastRecvT = 0;
     lastSentFrameId = -1;
     lastReceivedFrameId = -1;
@@ -666,6 +739,8 @@ export function createAiFaceClient({
       jpegQuality: activeJpegQuality,
       targetFps: cappedTargetFps,
       ultraRealtime: ultraMode,
+      textureBlendActive,
+      textureFrameVersion,
       lastError,
       slowPreview: lastRoundTripMs != null && lastRoundTripMs > slowPreviewLatencyMs,
       bufferedAmount: ws ? ws.bufferedAmount : null,
@@ -673,7 +748,10 @@ export function createAiFaceClient({
       msSinceReceive: lastRecvT ? now - lastRecvT : null
     };
   }
-  function getOutputCanvas() { return outputCanvas; }
+  function getOutputCanvas() {
+    updateTextureBlend();
+    return outputCanvas;
+  }
   function getOutputSize() { return activeOutputSize; }
 
   return {

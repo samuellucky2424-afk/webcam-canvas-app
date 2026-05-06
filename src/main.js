@@ -472,6 +472,7 @@ async function init() {
         ultraDriverSize: AI_FACE_CONFIG.ultraDriverSize,
         ultraOutputSize: AI_FACE_CONFIG.ultraOutputSize,
         ultraJpegQuality: AI_FACE_CONFIG.ultraJpegQuality,
+        textureBlendMs: AI_FACE_CONFIG.textureBlendMs,
         staleAfterMs: AI_FACE_CONFIG.staleAfterMs,
         slowPreviewLatencyMs: AI_FACE_CONFIG.slowPreviewLatencyMs,
         slowPreviewIntervalMs: AI_FACE_CONFIG.slowPreviewIntervalMs,
@@ -502,6 +503,11 @@ async function init() {
         offsetY: AI_FACE_CONFIG.offsetY,
         yawWeight: AI_FACE_CONFIG.yawWeight,
         pitchWeight: AI_FACE_CONFIG.pitchWeight,
+        latencyCompensation: AI_FACE_CONFIG.latencyCompensation,
+        predictionMs: AI_FACE_CONFIG.predictionMs,
+        maxPredictionMs: AI_FACE_CONFIG.maxPredictionMs,
+        motionSmoothingAlpha: AI_FACE_CONFIG.motionSmoothingAlpha,
+        velocitySmoothingAlpha: AI_FACE_CONFIG.velocitySmoothingAlpha,
         debug: AI_FACE_CONFIG.debug
       });
       // Expose runtime knobs for live calibration from DevTools:
@@ -553,10 +559,10 @@ async function init() {
         }
       },
       getFrame() {
-        // Only sync body motion to AI frames when LivePortrait is genuinely
-        // realtime. CPU inference can be tens of seconds late, so the body
-        // must keep following fresh MediaPipe landmarks in that mode.
-        if (aiFaceClient && isAiRealtime()) {
+        // Latency compensation mode decouples local motion from cloud texture
+        // arrival. The body/head always use the freshest MediaPipe pose, while
+        // the AI face renderer reuses and locally warps the last texture.
+        if (aiFaceClient && !AI_FACE_CONFIG.latencyCompensation && isAiRealtime()) {
           const synced = syncBuffer.getRenderState();
           if (synced?.overlay) {
             return {
@@ -583,7 +589,7 @@ async function init() {
               ...PUPPET_CONFIG,
               source: puppetImage,
               getHeadSource: aiFaceClient
-                ? () => (isAiRealtime() ? aiFaceClient.getOutputCanvas() : null)
+                ? () => (aiFaceClient.isReady() ? aiFaceClient.getOutputCanvas() : null)
                 : null
             }
           : null,
