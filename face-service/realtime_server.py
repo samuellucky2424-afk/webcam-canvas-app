@@ -12,7 +12,8 @@ Environment knobs:
     LIVEPORTRAIT_REQUIRE_CUDA=1
     LIVEPORTRAIT_SIZE=256
     LIVEPORTRAIT_TARGET_FPS=25
-    LIVEPORTRAIT_JPEG_QUALITY=80
+    LIVEPORTRAIT_JPEG_QUALITY=45
+    LIVEPORTRAIT_OUTPUT_SIZE=160
 """
 
 from __future__ import annotations
@@ -101,6 +102,7 @@ class RuntimeConfig:
     inference_size: int
     target_fps: int
     jpeg_quality: int
+    output_size: int
     warmup: bool
 
     @classmethod
@@ -113,8 +115,11 @@ class RuntimeConfig:
         if target_fps < 1:
             raise ValueError("LIVEPORTRAIT_TARGET_FPS must be at least 1.")
 
-        jpeg_quality = _env_int("LIVEPORTRAIT_JPEG_QUALITY", 80)
-        jpeg_quality = max(40, min(jpeg_quality, 95))
+        jpeg_quality = _env_int("LIVEPORTRAIT_JPEG_QUALITY", 45)
+        jpeg_quality = max(35, min(jpeg_quality, 65))
+
+        output_size = _env_int("LIVEPORTRAIT_OUTPUT_SIZE", 160)
+        output_size = max(128, min(output_size, 224))
 
         return cls(
             source=_resolve_path(os.getenv("LIVEPORTRAIT_SOURCE"), DEFAULT_SOURCE),
@@ -128,6 +133,7 @@ class RuntimeConfig:
             inference_size=size,
             target_fps=target_fps,
             jpeg_quality=jpeg_quality,
+            output_size=output_size,
             warmup=_env_bool("LIVEPORTRAIT_WARMUP", True),
         )
 
@@ -190,6 +196,8 @@ class RuntimeMetrics:
     decode_errors: int = 0
     inference_errors: int = 0
     send_errors: int = 0
+    rx_bytes: int = 0
+    tx_bytes: int = 0
     queue_depth: int = 0
     last_latency_ms: float = 0.0
     last_inference_ms: float = 0.0
@@ -292,10 +300,20 @@ class RealtimeState:
             "onnx_providers": self.onnx_providers,
             "source_path": str(cfg.source) if cfg else None,
             "size": cfg.inference_size if cfg else None,
+            "output_size": cfg.output_size if cfg else None,
+            "jpeg_quality": cfg.jpeg_quality if cfg else None,
             "target_fps": cfg.target_fps if cfg else None,
             "active_connections": self.metrics.active_connections,
             "rx_total": self.metrics.rx_total,
             "tx_total": self.metrics.tx_total,
+            "rx_bytes": self.metrics.rx_bytes,
+            "tx_bytes": self.metrics.tx_bytes,
+            "avg_rx_frame_bytes": round(self.metrics.rx_bytes / self.metrics.rx_total, 1)
+            if self.metrics.rx_total
+            else 0,
+            "avg_tx_frame_bytes": round(self.metrics.tx_bytes / self.metrics.tx_total, 1)
+            if self.metrics.tx_total
+            else 0,
             "stale_dropped": self.metrics.stale_dropped,
             "decode_errors": self.metrics.decode_errors,
             "inference_errors": self.metrics.inference_errors,
@@ -350,6 +368,7 @@ def _process_jpeg(
     engine: LivePortraitEngine,
     jpeg_in: bytes,
     jpeg_quality: int,
+    output_size: int,
 ) -> tuple[bytes, float]:
     arr = np.frombuffer(jpeg_in, dtype=np.uint8)
     frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
@@ -359,10 +378,21 @@ def _process_jpeg(
     with torch.inference_mode():
         out = engine.animate(frame)
 
+    if output_size and (out.shape[0] != output_size or out.shape[1] != output_size):
+        out = cv2.resize(out, (output_size, output_size), interpolation=cv2.INTER_AREA)
+
+    encode_params = [int(cv2.IMWRITE_JPEG_QUALITY), jpeg_quality]
+    progressive_flag = getattr(cv2, "IMWRITE_JPEG_PROGRESSIVE", None)
+    if progressive_flag is not None:
+        encode_params.extend([int(progressive_flag), 0])
+    optimize_flag = getattr(cv2, "IMWRITE_JPEG_OPTIMIZE", None)
+    if optimize_flag is not None:
+        encode_params.extend([int(optimize_flag), 1])
+
     ok, jpeg_out = cv2.imencode(
         ".jpg",
         out,
-        [int(cv2.IMWRITE_JPEG_QUALITY), jpeg_quality],
+        encode_params,
     )
     if not ok:
         raise RuntimeError("Could not encode LivePortrait output JPEG.")
@@ -398,6 +428,19 @@ async def healthz() -> dict:
     return state.health()
 
 
+def _query_int(websocket: WebSocket, names: tuple[str, ...], default: int, low: int, high: int) -> int:
+    for name in names:
+        raw = websocket.query_params.get(name)
+        if raw is None:
+            continue
+        try:
+            value = int(float(raw))
+        except ValueError:
+            continue
+        return max(low, min(value, high))
+    return default
+
+
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket) -> None:
     client = f"{websocket.client.host}:{websocket.client.port}" if websocket.client else "unknown"
@@ -414,12 +457,24 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
     slot = LatestFrameSlot()
     stop = asyncio.Event()
     min_interval = 1.0 / max(state.config.target_fps if state.config else 25, 1)
+    session_quality = _query_int(websocket, ("q", "quality", "jpeg_quality"), state.config.jpeg_quality if state.config else 45, 35, 65)
+    session_output_size = _query_int(websocket, ("out", "output", "output_size"), state.config.output_size if state.config else 160, 128, 224)
+    requested_driver_size = _query_int(websocket, ("driver", "driver_size"), 0, 0, 224)
+    logger.info(
+        "WebSocket realtime payload config client=%s driver=%s output=%d jpeg_quality=%d progressive=off",
+        client,
+        requested_driver_size or "-",
+        session_output_size,
+        session_quality,
+    )
     rx_since = 0
     tx_since = 0
+    rx_bytes_since = 0
+    tx_bytes_since = 0
     last_report = time.perf_counter()
 
     async def receiver() -> None:
-        nonlocal rx_since
+        nonlocal rx_since, rx_bytes_since
         try:
             while not stop.is_set():
                 payload = await websocket.receive_bytes()
@@ -427,7 +482,9 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                     continue
                 dropped = await slot.put(payload)
                 state.metrics.rx_total += 1
+                state.metrics.rx_bytes += len(payload)
                 rx_since += 1
+                rx_bytes_since += len(payload)
                 if dropped:
                     state.metrics.stale_dropped += 1
                 state.metrics.queue_depth = await slot.depth()
@@ -439,7 +496,7 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
             stop.set()
 
     async def worker() -> None:
-        nonlocal tx_since
+        nonlocal tx_since, tx_bytes_since
         last_send = 0.0
         while not stop.is_set():
             wait = min_interval - (time.perf_counter() - last_send)
@@ -462,7 +519,8 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                         _process_jpeg,
                         state.engine,
                         queued.payload,
-                        state.config.jpeg_quality,
+                        session_quality,
+                        session_output_size,
                     )
             except ValueError:
                 state.metrics.decode_errors += 1
@@ -483,14 +541,16 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
             now = time.perf_counter()
             latency_ms = (now - queued.received_at) * 1000.0
             state.metrics.tx_total += 1
+            state.metrics.tx_bytes += len(out_jpeg)
             state.metrics.last_latency_ms = latency_ms
             state.metrics.last_inference_ms = inference_ms
             state.metrics.sent_at.append(now)
             tx_since += 1
+            tx_bytes_since += len(out_jpeg)
             last_send = now
 
     async def reporter() -> None:
-        nonlocal rx_since, tx_since, last_report
+        nonlocal rx_since, tx_since, rx_bytes_since, tx_bytes_since, last_report
         while not stop.is_set():
             await asyncio.sleep(1.0)
             now = time.perf_counter()
@@ -499,17 +559,21 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
             state.metrics.queue_depth = queue_depth
             logger.info(
                 "LivePortrait ws stats inference_fps=%.1f rx=%.1f/s tx=%.1f/s queue_depth=%d "
-                "latency=%.1fms inference=%.1fms stale_dropped=%d",
+                "up=%.1fKB/s down=%.1fKB/s latency=%.1fms inference=%.1fms stale_dropped=%d",
                 state.metrics.inference_fps,
                 rx_since / elapsed,
                 tx_since / elapsed,
                 queue_depth,
+                (rx_bytes_since / 1024) / elapsed,
+                (tx_bytes_since / 1024) / elapsed,
                 state.metrics.last_latency_ms,
                 state.metrics.last_inference_ms,
                 state.metrics.stale_dropped,
             )
             rx_since = 0
             tx_since = 0
+            rx_bytes_since = 0
+            tx_bytes_since = 0
             last_report = now
 
     tasks = [

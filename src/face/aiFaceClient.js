@@ -4,15 +4,15 @@
  * Uploads downscaled driver frames (the user's webcam crop around the head)
  * as JPEG blobs to the Python face-service over a binary WebSocket, and
  * receives back AI-animated head frames as JPEGs which are decoded into a
- * reusable 256×256 canvas. That canvas is the `outputCanvas` consumed by the
+ * reusable low-resolution canvas. That canvas is the `outputCanvas` consumed by the
  * sprite head renderer in `aiHeadRenderer.js`.
  *
  * Design constraints honoured:
  *
  *  - One in flight. A new webcam frame is sent only after the previous
  *    LivePortrait response returns. Every other webcam frame is dropped.
- *  - Pre-allocated buffers. The driver scratch canvas (192×192) and the
- *    output canvas (256×256) are created once. No `new` allocations in the
+ *  - Pre-allocated buffers. The driver scratch canvas and the output canvas
+ *    are created once and resized only when realtime mode changes. No `new` allocations in the
  *    hot path apart from the unavoidable `Blob` and `ImageBitmap` returned
  *    by browser APIs (both are released).
  *  - Status fan-out. `connecting | open | closed` notifications
@@ -26,18 +26,29 @@
  * No retry storm: reconnection backs off through 1s, 2s, then 5s.
  */
 
-const DRIVER_SIZE = 192;
-const OUTPUT_SIZE = 256;
+const DEFAULT_DRIVER_SIZE = 160;
+const ULTRA_DRIVER_SIZE = 128;
+const DEFAULT_OUTPUT_SIZE = 160;
+const ULTRA_OUTPUT_SIZE = 128;
+const DEFAULT_JPEG_QUALITY = 0.45;
+const ULTRA_JPEG_QUALITY = 0.4;
+const MAX_JPEG_QUALITY = 0.5;
 const CONNECT_TIMEOUT_MS = 3000;
 const RECONNECT_DELAYS_MS = [1000, 2000, 5000];
 const STATUSES = ["closed", "connecting", "open"];
-const MAX_BUFFERED_BYTES = 150_000;
+const MAX_BUFFERED_BYTES = 80_000;
 const MAX_SEND_FPS = 15;
 
 export function createAiFaceClient({
   url = "ws://127.0.0.1:8765/ws",
   targetFps = 12,
-  jpegQuality = 0.6,
+  jpegQuality = DEFAULT_JPEG_QUALITY,
+  driverSize = DEFAULT_DRIVER_SIZE,
+  outputSize = DEFAULT_OUTPUT_SIZE,
+  ultraRealtime = false,
+  ultraDriverSize = ULTRA_DRIVER_SIZE,
+  ultraOutputSize = ULTRA_OUTPUT_SIZE,
+  ultraJpegQuality = ULTRA_JPEG_QUALITY,
   reconnect = true,
   connectTimeoutMs = CONNECT_TIMEOUT_MS,
   reconnectDelaysMs = RECONNECT_DELAYS_MS,
@@ -60,6 +71,12 @@ export function createAiFaceClient({
   let receivedFrames = 0;
   let sentFps = 0;
   let receivedFps = 0;
+  let uploadKBps = 0;
+  let downloadKBps = 0;
+  let uploadedBytes = 0;
+  let downloadedBytes = 0;
+  let uploadedBytesSince = 0;
+  let downloadedBytesSince = 0;
   let lastRoundTripMs = null;
   let serverInferenceMs = null;
   let serverInferenceFps = null;
@@ -78,6 +95,11 @@ export function createAiFaceClient({
   let reconnectTimer = null;
   let connectTimer = null;
   let manualDisconnect = false;
+  let ultraMode = !!ultraRealtime;
+  let activeDriverSize = 0;
+  let activeOutputSize = 0;
+  let activeJpegQuality = 0;
+  let activeUrl = url;
   const listeners = new Set();
 
   const cappedTargetFps = Math.max(1, Math.min(targetFps, MAX_SEND_FPS));
@@ -87,18 +109,80 @@ export function createAiFaceClient({
     ? reconnectDelaysMs
     : RECONNECT_DELAYS_MS;
 
+  function clampNumber(value, min, max, fallback) {
+    const n = Number(value);
+    if (!Number.isFinite(n)) return fallback;
+    return Math.max(min, Math.min(max, n));
+  }
+
+  function clampSize(value, fallback) {
+    return Math.round(clampNumber(value, 96, 224, fallback));
+  }
+
+  function refreshModeValues() {
+    activeDriverSize = ultraMode
+      ? clampSize(ultraDriverSize, ULTRA_DRIVER_SIZE)
+      : clampSize(driverSize, DEFAULT_DRIVER_SIZE);
+    activeOutputSize = ultraMode
+      ? clampSize(ultraOutputSize, ULTRA_OUTPUT_SIZE)
+      : clampSize(outputSize, DEFAULT_OUTPUT_SIZE);
+    activeJpegQuality = ultraMode
+      ? clampNumber(ultraJpegQuality, 0.25, MAX_JPEG_QUALITY, ULTRA_JPEG_QUALITY)
+      : clampNumber(jpegQuality, 0.25, MAX_JPEG_QUALITY, DEFAULT_JPEG_QUALITY);
+  }
+
+  refreshModeValues();
+
   // ---------------- canvases (preallocated) ----------------
   const driverCanvas = document.createElement("canvas");
-  driverCanvas.width = DRIVER_SIZE;
-  driverCanvas.height = DRIVER_SIZE;
+  driverCanvas.width = activeDriverSize;
+  driverCanvas.height = activeDriverSize;
   const driverCtx = driverCanvas.getContext("2d", { alpha: false, desynchronized: true });
 
   const outputCanvas = document.createElement("canvas");
-  outputCanvas.width = OUTPUT_SIZE;
-  outputCanvas.height = OUTPUT_SIZE;
+  outputCanvas.width = activeOutputSize;
+  outputCanvas.height = activeOutputSize;
   const outputCtx = outputCanvas.getContext("2d", { alpha: true });
 
   // ---------------- helpers ----------------
+  function configureCanvasState() {
+    if (driverCtx) {
+      driverCtx.imageSmoothingEnabled = true;
+      driverCtx.imageSmoothingQuality = "low";
+    }
+    if (outputCtx) {
+      outputCtx.imageSmoothingEnabled = true;
+      outputCtx.imageSmoothingQuality = "low";
+    }
+  }
+
+  configureCanvasState();
+
+  function resizePayloadCanvases() {
+    if (driverCanvas.width !== activeDriverSize || driverCanvas.height !== activeDriverSize) {
+      driverCanvas.width = activeDriverSize;
+      driverCanvas.height = activeDriverSize;
+    }
+    if (outputCanvas.width !== activeOutputSize || outputCanvas.height !== activeOutputSize) {
+      outputCanvas.width = activeOutputSize;
+      outputCanvas.height = activeOutputSize;
+    }
+    configureCanvasState();
+  }
+
+  function buildWsUrl() {
+    try {
+      const next = new URL(url, window.location.href);
+      next.searchParams.set("driver", String(activeDriverSize));
+      next.searchParams.set("out", String(activeOutputSize));
+      next.searchParams.set("q", String(Math.round(activeJpegQuality * 100)));
+      next.searchParams.set("mode", ultraMode ? "ultra" : "realtime");
+      return next.toString();
+    } catch (_) {
+      return url;
+    }
+  }
+
   function setStatus(next) {
     if (!STATUSES.includes(next)) return;
     if (status === next) return;
@@ -160,7 +244,7 @@ export function createAiFaceClient({
     clearConnectTimer();
     reconnectAttempt = 0;
     lastError = "";
-    console.info("open", { url });
+    console.info("open", { url: activeUrl, mode: ultraMode ? "ultra" : "realtime" });
     setStatus("open");
   }
 
@@ -168,7 +252,7 @@ export function createAiFaceClient({
     if (socket !== ws) return;
     clearConnectTimer();
     console.info("close", {
-      url,
+      url: activeUrl,
       code: ev?.code,
       reason: ev?.reason || "",
       wasClean: ev?.wasClean
@@ -209,12 +293,23 @@ export function createAiFaceClient({
         : typeof data.byteLength === "number"
           ? data.byteLength
           : null;
-    console.info("message", { url, bytes: byteLength });
+    if (byteLength != null) {
+      downloadedBytes += byteLength;
+      downloadedBytesSince += byteLength;
+    }
     let bitmap = null;
     try {
       const blob = data instanceof Blob ? data : new Blob([data], { type: "image/jpeg" });
-      bitmap = await createImageBitmap(blob);
-      outputCtx.drawImage(bitmap, 0, 0, OUTPUT_SIZE, OUTPUT_SIZE);
+      try {
+        bitmap = await createImageBitmap(blob, {
+          resizeWidth: activeOutputSize,
+          resizeHeight: activeOutputSize,
+          resizeQuality: "low"
+        });
+      } catch (_) {
+        bitmap = await createImageBitmap(blob);
+      }
+      outputCtx.drawImage(bitmap, 0, 0, activeOutputSize, activeOutputSize);
       receivedFrames += 1;
       receivedSince += 1;
       lastError = "";
@@ -242,12 +337,20 @@ export function createAiFaceClient({
     const elapsed = now - lastRateT;
     sentFps = (sentSince * 1000) / elapsed;
     receivedFps = (receivedSince * 1000) / elapsed;
+    uploadKBps = (uploadedBytesSince / 1024) * (1000 / elapsed);
+    downloadKBps = (downloadedBytesSince / 1024) * (1000 / elapsed);
     sentSince = 0;
     receivedSince = 0;
+    uploadedBytesSince = 0;
+    downloadedBytesSince = 0;
     lastRateT = now;
     console.info("aiFace rates", {
       sentFps: Number(sentFps.toFixed(1)),
       receivedFps: Number(receivedFps.toFixed(1)),
+      uploadKBps: Number(uploadKBps.toFixed(1)),
+      downloadKBps: Number(downloadKBps.toFixed(1)),
+      avgUploadBytes: sentFrames ? Math.round(uploadedBytes / sentFrames) : 0,
+      avgDownloadBytes: rawReceivedFrames ? Math.round(downloadedBytes / rawReceivedFrames) : 0,
       bufferedAmount: ws ? ws.bufferedAmount : null,
       activeInFlightCount: awaitingResponse ? 1 : 0,
       skippedFrames
@@ -260,9 +363,16 @@ export function createAiFaceClient({
     clearConnectTimer();
     manualDisconnect = false;
     setStatus("connecting");
-    console.info("connecting", { url });
+    activeUrl = buildWsUrl();
+    console.info("connecting", {
+      url: activeUrl,
+      driverSize: activeDriverSize,
+      outputSize: activeOutputSize,
+      jpegQuality: activeJpegQuality,
+      mode: ultraMode ? "ultra" : "realtime"
+    });
     try {
-      const socket = new WebSocket(url);
+      const socket = new WebSocket(activeUrl);
       ws = socket;
       socket.binaryType = "blob";
       connectTimer = setTimeout(() => {
@@ -270,7 +380,7 @@ export function createAiFaceClient({
         connectTimer = null;
         console.error("error", new Error(`WebSocket connection timed out after ${connectTimeoutMs} ms`));
         console.info("close", {
-          url,
+          url: activeUrl,
           code: "timeout",
           reason: "connect timeout",
           wasClean: false
@@ -350,7 +460,7 @@ export function createAiFaceClient({
       drawDriverCrop(source, state);
       if (driverCanvas.toBlob) {
         const blob = await new Promise((resolve) => {
-          driverCanvas.toBlob(resolve, "image/jpeg", jpegQuality);
+          driverCanvas.toBlob(resolve, "image/jpeg", activeJpegQuality);
         });
         if (!blob) return;
         if (socket !== ws || socket.readyState !== WebSocket.OPEN) return;
@@ -362,9 +472,11 @@ export function createAiFaceClient({
           skipFrame("buffered");
           return;
         }
+        uploadedBytes += blob.size;
+        uploadedBytesSince += blob.size;
         socket.send(blob);
       } else {
-        const dataUrl = driverCanvas.toDataURL("image/jpeg", jpegQuality);
+        const dataUrl = driverCanvas.toDataURL("image/jpeg", activeJpegQuality);
         const bin = atob(dataUrl.split(",")[1]);
         const buf = new Uint8Array(bin.length);
         for (let i = 0; i < bin.length; i += 1) buf[i] = bin.charCodeAt(i);
@@ -377,6 +489,8 @@ export function createAiFaceClient({
           skipFrame("buffered");
           return;
         }
+        uploadedBytes += buf.byteLength;
+        uploadedBytesSince += buf.byteLength;
         socket.send(buf.buffer);
       }
 
@@ -468,8 +582,8 @@ export function createAiFaceClient({
     if (y + crop > sh) y = sh - crop;
 
     driverCtx.fillStyle = "#000";
-    driverCtx.fillRect(0, 0, DRIVER_SIZE, DRIVER_SIZE);
-    driverCtx.drawImage(source, x, y, crop, crop, 0, 0, DRIVER_SIZE, DRIVER_SIZE);
+    driverCtx.fillRect(0, 0, activeDriverSize, activeDriverSize);
+    driverCtx.drawImage(source, x, y, crop, crop, 0, 0, activeDriverSize, activeDriverSize);
   }
 
   function onStatusChange(cb) {
@@ -483,12 +597,41 @@ export function createAiFaceClient({
     if (Number.isFinite(inferenceFps)) serverInferenceFps = inferenceFps;
   }
 
+  function setUltraRealtimeMode(on) {
+    const next = !!on;
+    if (next === ultraMode) return;
+    ultraMode = next;
+    refreshModeValues();
+    resizePayloadCanvases();
+    awaitingResponse = false;
+    encoding = false;
+    lastRecvT = 0;
+    lastSentFrameId = -1;
+    lastReceivedFrameId = -1;
+    if (syncBuffer) syncBuffer.clearPin();
+    updateInFlight();
+
+    const socket = ws;
+    if (socket && (socket.readyState === WebSocket.CONNECTING || socket.readyState === WebSocket.OPEN)) {
+      closeSocket(socket);
+      clearReconnectTimer();
+      reconnectTimer = setTimeout(() => {
+        reconnectTimer = null;
+        connect();
+      }, 0);
+    }
+  }
+
+  function getUltraRealtimeMode() {
+    return ultraMode;
+  }
+
   function getStatus() { return status; }
   function getStats() {
     const now = performance.now();
     return {
       status,
-      url,
+      url: activeUrl || buildWsUrl(),
       sentFrames,
       rawReceivedFrames,
       receivedFrames,
@@ -512,9 +655,17 @@ export function createAiFaceClient({
       serverInferenceMs,
       serverInferenceFps,
       inferenceTimeMs: serverInferenceMs,
-      driverSize: DRIVER_SIZE,
-      jpegQuality,
+      uploadKBps,
+      downloadKBps,
+      uploadedBytes,
+      downloadedBytes,
+      avgUploadFrameBytes: sentFrames ? uploadedBytes / sentFrames : 0,
+      avgDownloadFrameBytes: rawReceivedFrames ? downloadedBytes / rawReceivedFrames : 0,
+      driverSize: activeDriverSize,
+      outputSize: activeOutputSize,
+      jpegQuality: activeJpegQuality,
       targetFps: cappedTargetFps,
+      ultraRealtime: ultraMode,
       lastError,
       slowPreview: lastRoundTripMs != null && lastRoundTripMs > slowPreviewLatencyMs,
       bufferedAmount: ws ? ws.bufferedAmount : null,
@@ -523,7 +674,7 @@ export function createAiFaceClient({
     };
   }
   function getOutputCanvas() { return outputCanvas; }
-  function getOutputSize() { return OUTPUT_SIZE; }
+  function getOutputSize() { return activeOutputSize; }
 
   return {
     connect,
@@ -534,6 +685,8 @@ export function createAiFaceClient({
     getStatus,
     getStats,
     setServerMetrics,
+    setUltraRealtimeMode,
+    getUltraRealtimeMode,
     onStatusChange,
     getLastReceivedFrameId,
     getOutputCanvas,

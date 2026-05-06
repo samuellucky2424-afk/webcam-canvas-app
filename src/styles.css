@@ -192,6 +192,20 @@ body {
   image-rendering: auto;
 }
 
+.ai-bridge-toggle {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--hud-muted);
+  pointer-events: auto;
+  user-select: none;
+}
+
+.ai-bridge-toggle input {
+  accent-color: var(--accent);
+  margin: 0;
+}
+
 @media (max-width: 720px) {
   .hud-header {
     flex-direction: column;

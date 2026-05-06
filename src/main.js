@@ -108,8 +108,10 @@ function attachAiBridge(client, { sourceImageUrl = null } = {}) {
   const state = root.querySelector("#ai-bridge-state");
   const sent = root.querySelector("#ai-bridge-sent");
   const received = root.querySelector("#ai-bridge-received");
+  const bitrate = root.querySelector("#ai-bridge-bitrate");
   const latency = root.querySelector("#ai-bridge-latency");
   const last = root.querySelector("#ai-bridge-last");
+  const ultraToggle = root.querySelector("#ai-ultra-mode");
   const previewCtx = preview?.getContext("2d");
   let lastDrawnReceived = -1;
   let sourcePreview = null;
@@ -120,6 +122,12 @@ function attachAiBridge(client, { sourceImageUrl = null } = {}) {
   let serverInferenceFps = null;
 
   root.hidden = false;
+  if (ultraToggle && client.getUltraRealtimeMode && client.setUltraRealtimeMode) {
+    ultraToggle.checked = client.getUltraRealtimeMode();
+    ultraToggle.addEventListener("change", () => {
+      client.setUltraRealtimeMode(ultraToggle.checked);
+    });
+  }
 
   if (sourceImageUrl && previewCtx) {
     loadImage(sourceImageUrl)
@@ -183,11 +191,14 @@ function attachAiBridge(client, { sourceImageUrl = null } = {}) {
     state.textContent = `state: ${stats.status}${stats.awaitingResponse ? " / waiting" : ""} / in-flight: ${stats.activeInFlightCount}`;
     sent.textContent = `sent: ${stats.sentFrames} (${stats.sentFps.toFixed(1)}/s) / skipped: ${stats.skippedFrames}`;
     received.textContent = `received: ${stats.receivedFrames}/${stats.rawReceivedFrames} (${stats.receivedFps.toFixed(1)}/s)`;
+    if (bitrate) {
+      bitrate.textContent = `net: up ${stats.uploadKBps.toFixed(1)} KB/s / down ${stats.downloadKBps.toFixed(1)} KB/s / avg ${Math.round(stats.avgUploadFrameBytes)}B:${Math.round(stats.avgDownloadFrameBytes)}B`;
+    }
     if (latency) {
       const rtt = stats.websocketRttMs == null ? "-" : `${stats.websocketRttMs.toFixed(0)} ms`;
       const infer = Number.isFinite(serverInferenceMs) ? `${serverInferenceMs.toFixed(0)} ms` : "-";
       const inferFps = Number.isFinite(serverInferenceFps) ? ` @ ${serverInferenceFps.toFixed(1)}/s` : "";
-      latency.textContent = `rtt: ${rtt} / infer: ${infer}${inferFps}`;
+      latency.textContent = `rtt: ${rtt} / infer: ${infer}${inferFps} / ${stats.driverSize}->${stats.outputSize} q${Math.round(stats.jpegQuality * 100)}`;
     }
     last.textContent = `last: ${
       stats.msSinceReceive == null ? "-" : `${(stats.msSinceReceive / 1000).toFixed(1)}s ago`
@@ -200,7 +211,10 @@ function attachAiBridge(client, { sourceImageUrl = null } = {}) {
 
     if (previewCtx) {
       if (stats.receivedFrames > 0 && stats.receivedFrames !== lastDrawnReceived) {
-        previewCtx.clearRect(0, 0, preview.width, preview.height);
+        if (preview.width !== stats.outputSize || preview.height !== stats.outputSize) {
+          preview.width = stats.outputSize;
+          preview.height = stats.outputSize;
+        }
         previewCtx.drawImage(client.getOutputCanvas(), 0, 0, preview.width, preview.height);
         lastDrawnReceived = stats.receivedFrames;
         sourcePreviewDrawn = false;
@@ -452,6 +466,12 @@ async function init() {
         reconnectDelaysMs: AI_FACE_CONFIG.reconnectDelaysMs,
         targetFps: AI_FACE_CONFIG.targetFps,
         jpegQuality: AI_FACE_CONFIG.jpegQuality,
+        driverSize: AI_FACE_CONFIG.driverSize,
+        outputSize: AI_FACE_CONFIG.outputSize,
+        ultraRealtime: AI_FACE_CONFIG.ultraRealtime,
+        ultraDriverSize: AI_FACE_CONFIG.ultraDriverSize,
+        ultraOutputSize: AI_FACE_CONFIG.ultraOutputSize,
+        ultraJpegQuality: AI_FACE_CONFIG.ultraJpegQuality,
         staleAfterMs: AI_FACE_CONFIG.staleAfterMs,
         slowPreviewLatencyMs: AI_FACE_CONFIG.slowPreviewLatencyMs,
         slowPreviewIntervalMs: AI_FACE_CONFIG.slowPreviewIntervalMs,

@@ -44,11 +44,16 @@
 
     <div id="ai-bridge" class="ai-bridge" hidden>
       <strong>MediaPipe -> LivePortrait</strong>
-      <canvas id="ai-bridge-preview" width="256" height="256"></canvas>
+      <canvas id="ai-bridge-preview" width="160" height="160"></canvas>
+      <label class="ai-bridge-toggle">
+        <input id="ai-ultra-mode" type="checkbox">
+        <span>Ultra RT</span>
+      </label>
       <span id="ai-bridge-source">source: -</span>
       <span id="ai-bridge-state">state: closed</span>
       <span id="ai-bridge-sent">sent: 0</span>
       <span id="ai-bridge-received">received: 0</span>
+      <span id="ai-bridge-bitrate">net: -</span>
       <span id="ai-bridge-latency">latency: -</span>
       <span id="ai-bridge-last">last: -</span>
     </div>
