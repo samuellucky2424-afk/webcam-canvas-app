@@ -138,8 +138,8 @@ export const AVATAR_CONFIG = {
 // becomes ready, and reverts to the local default head atomically on
 // disconnect / stale-frame timeout.
 export const AI_FACE_CONFIG = {
-  enabled: false,
-  url: "ws://127.0.0.1:8765/ws",
+  enabled: true,
+  url: "wss://osts5obpvv4kv5-8765.proxy.runpod.net/ws",
   connectTimeoutMs: 3000,
   reconnectDelaysMs: [1000, 2000, 5000],
   targetFps: lowEndCpu ? 12 : 20,
