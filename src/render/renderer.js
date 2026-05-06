@@ -149,6 +149,7 @@ export function createRenderer({
   video,
   canvas,
   targetFps,
+  renderFps = 60,
   minimumFps,
   initialScale,
   minScale,
@@ -278,14 +279,14 @@ export function createRenderer({
       lastRenderTime = now;
     }
 
-    const frameInterval = 1000 / targetFps;
+    const frameInterval = renderFps > 0 ? 1000 / renderFps : 0;
     const elapsedSinceRender = now - lastRenderTime;
 
-    if (elapsedSinceRender < frameInterval) {
+    if (frameInterval > 0 && elapsedSinceRender < frameInterval) {
       return;
     }
 
-    lastRenderTime = now - (elapsedSinceRender % frameInterval);
+    lastRenderTime = frameInterval > 0 ? now - (elapsedSinceRender % frameInterval) : now;
     beforeRender?.(now);
     resizeCanvas();
     // Avatar-only stage: clear so the CSS background shows through. The live

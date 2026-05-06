@@ -51,6 +51,16 @@ export function createAiFaceClient({
   ultraOutputSize = ULTRA_OUTPUT_SIZE,
   ultraJpegQuality = ULTRA_JPEG_QUALITY,
   textureBlendMs = DEFAULT_TEXTURE_BLEND_MS,
+  adaptiveSend = true,
+  posePositionThreshold = 0.012,
+  poseRotationThreshold = 0.045,
+  poseExpressionThreshold = 0.08,
+  maxPoseSilenceMs = 900,
+  adaptiveQuality = true,
+  highRttMs = 500,
+  stableRttMs = 320,
+  qualityDownshiftFrames = 2,
+  qualityRestoreFrames = 8,
   reconnect = true,
   connectTimeoutMs = CONNECT_TIMEOUT_MS,
   reconnectDelaysMs = RECONNECT_DELAYS_MS,
@@ -89,6 +99,7 @@ export function createAiFaceClient({
   let skippedEncoding = 0;
   let skippedSocket = 0;
   let skippedBuffered = 0;
+  let skippedPose = 0;
   let sentSince = 0;
   let receivedSince = 0;
   let lastRateT = performance.now();
@@ -105,6 +116,11 @@ export function createAiFaceClient({
   let textureBlendStartT = 0;
   let textureBlendActive = false;
   let textureFrameVersion = 0;
+  let autoLowLatency = false;
+  let highRttStreak = 0;
+  let stableRttStreak = 0;
+  let lastPoseSignature = null;
+  let lastPoseSendT = 0;
   const listeners = new Set();
 
   const cappedTargetFps = Math.max(1, Math.min(targetFps, MAX_SEND_FPS));
@@ -125,13 +141,14 @@ export function createAiFaceClient({
   }
 
   function refreshModeValues() {
-    activeDriverSize = ultraMode
+    const lowLatencyMode = ultraMode || autoLowLatency;
+    activeDriverSize = lowLatencyMode
       ? clampSize(ultraDriverSize, ULTRA_DRIVER_SIZE)
       : clampSize(driverSize, DEFAULT_DRIVER_SIZE);
-    activeOutputSize = ultraMode
+    activeOutputSize = lowLatencyMode
       ? clampSize(ultraOutputSize, ULTRA_OUTPUT_SIZE)
       : clampSize(outputSize, DEFAULT_OUTPUT_SIZE);
-    activeJpegQuality = ultraMode
+    activeJpegQuality = lowLatencyMode
       ? clampNumber(ultraJpegQuality, 0.25, MAX_JPEG_QUALITY, ULTRA_JPEG_QUALITY)
       : clampNumber(jpegQuality, 0.25, MAX_JPEG_QUALITY, DEFAULT_JPEG_QUALITY);
   }
@@ -231,7 +248,7 @@ export function createAiFaceClient({
       next.searchParams.set("driver", String(activeDriverSize));
       next.searchParams.set("out", String(activeOutputSize));
       next.searchParams.set("q", String(Math.round(activeJpegQuality * 100)));
-      next.searchParams.set("mode", ultraMode ? "ultra" : "realtime");
+      next.searchParams.set("mode", ultraMode ? "ultra" : (autoLowLatency ? "auto-low" : "realtime"));
       return next.toString();
     } catch (_) {
       return url;
@@ -299,7 +316,7 @@ export function createAiFaceClient({
     clearConnectTimer();
     reconnectAttempt = 0;
     lastError = "";
-    console.info("open", { url: activeUrl, mode: ultraMode ? "ultra" : "realtime" });
+    console.info("open", { url: activeUrl, mode: ultraMode ? "ultra" : (autoLowLatency ? "auto-low" : "realtime") });
     setStatus("open");
   }
 
@@ -400,6 +417,7 @@ export function createAiFaceClient({
     } finally {
       if (bitmap && typeof bitmap.close === "function") bitmap.close();
     }
+    adaptQualityFromRtt();
     tickRates();
   }
 
@@ -441,7 +459,7 @@ export function createAiFaceClient({
       driverSize: activeDriverSize,
       outputSize: activeOutputSize,
       jpegQuality: activeJpegQuality,
-      mode: ultraMode ? "ultra" : "realtime"
+      mode: ultraMode ? "ultra" : (autoLowLatency ? "auto-low" : "realtime")
     });
     try {
       const socket = new WebSocket(activeUrl);
@@ -508,8 +526,77 @@ export function createAiFaceClient({
     else if (reason === "throttle") skippedThrottle += 1;
     else if (reason === "encoding") skippedEncoding += 1;
     else if (reason === "buffered") skippedBuffered += 1;
+    else if (reason === "pose") skippedPose += 1;
     else skippedSocket += 1;
     tickRates();
+  }
+
+  function getJoint(state, name) {
+    return state?.skeleton?.joints?.[name] ?? state?.overlay?.skeleton?.joints?.[name] ?? null;
+  }
+
+  function poseSignature(state) {
+    const headPose = state?.headPose ?? {};
+    const nose = getJoint(state, "nose");
+    const neck = getJoint(state, "neck");
+    const leftEye = getJoint(state, "leftEye");
+    const rightEye = getJoint(state, "rightEye");
+    const anchor = nose ?? neck ?? leftEye ?? rightEye ?? null;
+    let eyeDistance = 0;
+    if (leftEye && rightEye) {
+      eyeDistance = Math.hypot((leftEye.x ?? 0) - (rightEye.x ?? 0), (leftEye.y ?? 0) - (rightEye.y ?? 0));
+    }
+    return {
+      x: Number(anchor?.x ?? 0),
+      y: Number(anchor?.y ?? 0),
+      eyeDistance,
+      yaw: Number(headPose.yaw ?? 0),
+      pitch: Number(headPose.pitch ?? 0),
+      roll: Number(headPose.roll ?? 0),
+      mouthOpen: Number(headPose.mouthOpen ?? state?.faceSignals?.mouthOpen ?? 0),
+      eyeOpen: Number(headPose.eyeOpen ?? 1),
+      smile: Number(headPose.smile ?? 0)
+    };
+  }
+
+  function poseChangedEnough(prev, next) {
+    if (!prev || !next) return true;
+    const posDelta = Math.hypot(next.x - prev.x, next.y - prev.y);
+    const scaleDelta = Math.abs(next.eyeDistance - prev.eyeDistance);
+    const rotDelta = Math.max(
+      Math.abs(next.yaw - prev.yaw),
+      Math.abs(next.pitch - prev.pitch),
+      Math.abs(next.roll - prev.roll)
+    );
+    const exprDelta = Math.max(
+      Math.abs(next.mouthOpen - prev.mouthOpen),
+      Math.abs(next.eyeOpen - prev.eyeOpen),
+      Math.abs(next.smile - prev.smile)
+    );
+    return (
+      posDelta >= posePositionThreshold ||
+      scaleDelta >= posePositionThreshold * 0.8 ||
+      rotDelta >= poseRotationThreshold ||
+      exprDelta >= poseExpressionThreshold
+    );
+  }
+
+  function shouldSendForPose(state, now) {
+    if (!adaptiveSend) return true;
+    const signature = poseSignature(state);
+    if (!lastPoseSignature) {
+      lastPoseSignature = signature;
+      return true;
+    }
+    if (poseChangedEnough(lastPoseSignature, signature)) {
+      lastPoseSignature = signature;
+      return true;
+    }
+    if (!lastPoseSendT || now - lastPoseSendT >= maxPoseSilenceMs) {
+      lastPoseSignature = signature;
+      return true;
+    }
+    return false;
   }
 
   function handleReplyTimeout(now) {
@@ -521,6 +608,59 @@ export function createAiFaceClient({
       closeSocket(socket);
     }
     return true;
+  }
+
+  function reconnectForQualityChange() {
+    refreshModeValues();
+    resizePayloadCanvases();
+    awaitingResponse = false;
+    encoding = false;
+    updateInFlight();
+
+    const socket = ws;
+    if (socket && (socket.readyState === WebSocket.CONNECTING || socket.readyState === WebSocket.OPEN)) {
+      closeSocket(socket);
+      clearReconnectTimer();
+      reconnectTimer = setTimeout(() => {
+        reconnectTimer = null;
+        connect();
+      }, 0);
+    }
+  }
+
+  function setAutoLowLatency(next) {
+    if (ultraMode) return;
+    if (autoLowLatency === next) return;
+    autoLowLatency = next;
+    console.info("aiFace adaptive quality", {
+      mode: autoLowLatency ? "auto-low" : "realtime",
+      rtt: lastRoundTripMs
+    });
+    reconnectForQualityChange();
+  }
+
+  function adaptQualityFromRtt() {
+    if (!adaptiveQuality || lastRoundTripMs == null || ultraMode) return;
+    if (lastRoundTripMs >= highRttMs) {
+      highRttStreak += 1;
+      stableRttStreak = 0;
+      if (!autoLowLatency && highRttStreak >= qualityDownshiftFrames) {
+        setAutoLowLatency(true);
+      }
+      return;
+    }
+
+    if (lastRoundTripMs <= stableRttMs) {
+      stableRttStreak += 1;
+      highRttStreak = 0;
+      if (autoLowLatency && stableRttStreak >= qualityRestoreFrames) {
+        setAutoLowLatency(false);
+      }
+      return;
+    }
+
+    highRttStreak = 0;
+    stableRttStreak = 0;
   }
 
   async function sendCurrentFrame(source, state, socket) {
@@ -570,6 +710,7 @@ export function createAiFaceClient({
       lastSentFrameId = frameId;
       awaitingResponse = true;
       updateInFlight();
+      lastPoseSendT = lastSendT;
       sentFrames += 1;
       sentSince += 1;
     } catch (error) {
@@ -607,6 +748,10 @@ export function createAiFaceClient({
     }
     if (lastSendT && now - lastSendT < minIntervalMs) {
       skipFrame("throttle");
+      return;
+    }
+    if (!shouldSendForPose(state, now)) {
+      skipFrame("pose");
       return;
     }
     if (ws.bufferedAmount > MAX_BUFFERED_BYTES) {
@@ -675,6 +820,9 @@ export function createAiFaceClient({
     ultraMode = next;
     refreshModeValues();
     resizePayloadCanvases();
+    autoLowLatency = false;
+    highRttStreak = 0;
+    stableRttStreak = 0;
     awaitingResponse = false;
     encoding = false;
     textureBlendActive = false;
@@ -719,6 +867,7 @@ export function createAiFaceClient({
       skippedEncoding,
       skippedSocket,
       skippedBuffered,
+      skippedPose,
       sentFps,
       receivedFps,
       lastSentFrameId,
@@ -739,6 +888,9 @@ export function createAiFaceClient({
       jpegQuality: activeJpegQuality,
       targetFps: cappedTargetFps,
       ultraRealtime: ultraMode,
+      autoLowLatency,
+      queueDepth: awaitingResponse ? 1 : 0,
+      droppedFrames: skippedFrames,
       textureBlendActive,
       textureFrameVersion,
       lastError,

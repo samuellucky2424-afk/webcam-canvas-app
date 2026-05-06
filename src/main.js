@@ -188,9 +188,10 @@ function attachAiBridge(client, { sourceImageUrl = null } = {}) {
   setInterval(() => {
     const stats = client.getStats();
     refreshHealth(stats);
-    state.textContent = `state: ${stats.status}${stats.awaitingResponse ? " / waiting" : ""} / in-flight: ${stats.activeInFlightCount}`;
-    sent.textContent = `sent: ${stats.sentFrames} (${stats.sentFps.toFixed(1)}/s) / skipped: ${stats.skippedFrames}`;
-    received.textContent = `received: ${stats.receivedFrames}/${stats.rawReceivedFrames} (${stats.receivedFps.toFixed(1)}/s)`;
+    const mode = stats.ultraRealtime ? "ultra" : (stats.autoLowLatency ? "auto-low" : "rt");
+    state.textContent = `state: ${stats.status}${stats.awaitingResponse ? " / waiting" : ""} / q:${stats.queueDepth} / ${mode}`;
+    sent.textContent = `sent: ${stats.sentFrames} (${stats.sentFps.toFixed(1)}/s) / dropped: ${stats.droppedFrames}`;
+    received.textContent = `ai: ${stats.receivedFrames}/${stats.rawReceivedFrames} (${stats.receivedFps.toFixed(1)}/s)`;
     if (bitrate) {
       bitrate.textContent = `net: up ${stats.uploadKBps.toFixed(1)} KB/s / down ${stats.downloadKBps.toFixed(1)} KB/s / avg ${Math.round(stats.avgUploadFrameBytes)}B:${Math.round(stats.avgDownloadFrameBytes)}B`;
     }
@@ -473,6 +474,16 @@ async function init() {
         ultraOutputSize: AI_FACE_CONFIG.ultraOutputSize,
         ultraJpegQuality: AI_FACE_CONFIG.ultraJpegQuality,
         textureBlendMs: AI_FACE_CONFIG.textureBlendMs,
+        adaptiveSend: AI_FACE_CONFIG.adaptiveSend,
+        posePositionThreshold: AI_FACE_CONFIG.posePositionThreshold,
+        poseRotationThreshold: AI_FACE_CONFIG.poseRotationThreshold,
+        poseExpressionThreshold: AI_FACE_CONFIG.poseExpressionThreshold,
+        maxPoseSilenceMs: AI_FACE_CONFIG.maxPoseSilenceMs,
+        adaptiveQuality: AI_FACE_CONFIG.adaptiveQuality,
+        highRttMs: AI_FACE_CONFIG.highRttMs,
+        stableRttMs: AI_FACE_CONFIG.stableRttMs,
+        qualityDownshiftFrames: AI_FACE_CONFIG.qualityDownshiftFrames,
+        qualityRestoreFrames: AI_FACE_CONFIG.qualityRestoreFrames,
         staleAfterMs: AI_FACE_CONFIG.staleAfterMs,
         slowPreviewLatencyMs: AI_FACE_CONFIG.slowPreviewLatencyMs,
         slowPreviewIntervalMs: AI_FACE_CONFIG.slowPreviewIntervalMs,

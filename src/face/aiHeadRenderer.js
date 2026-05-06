@@ -110,6 +110,15 @@ export function createAiHeadRenderer({
     vyaw: 0,
     vpitch: 0
   };
+  const spring = {
+    lastT: 0,
+    vx: 0,
+    vy: 0,
+    vr: 0,
+    va: 0,
+    vyaw: 0,
+    vpitch: 0
+  };
   // Smoothed color state — primed at the configured targets so the very
   // first frame already looks right.
   const c = {
@@ -226,6 +235,19 @@ export function createAiHeadRenderer({
     };
   }
 
+  function springScalar(current, target, velocityKey, dt, stiffness, damping) {
+    const velocity = (spring[velocityKey] + (target - current) * stiffness * dt) * Math.exp(-damping * dt);
+    spring[velocityKey] = velocity;
+    return current + velocity * dt;
+  }
+
+  function springAngle(current, target, velocityKey, dt, stiffness, damping) {
+    const delta = angleDelta(current, target);
+    const velocity = (spring[velocityKey] + delta * stiffness * dt) * Math.exp(-damping * dt);
+    spring[velocityKey] = velocity;
+    return current + velocity * dt;
+  }
+
   function smoothFrame(frame) {
     const motionA = clamp(latencyCompensation ? motionSmoothingAlpha : smoothingAlpha, 0.02, 0.85);
     const posA = clamp(latencyCompensation ? motionA : smoothingAlpha + 0.05, 0.02, 0.85);
@@ -306,12 +328,25 @@ export function createAiHeadRenderer({
     const yawStep = clampStep(s.yaw, yaw, maxAxisStep);
     const pitchStep = clampStep(s.pitch, pitch, maxAxisStep);
 
-    s.cx = lerp(s.cx, clampedAnchor.x, posA);
-    s.cy = lerp(s.cy, clampedAnchor.y, posA);
-    s.radius = lerp(s.radius, radiusStep, scaleA);
-    s.angle = lerpAngle(s.angle, angleStep, rotA);
-    s.yaw = lerp(s.yaw, yawStep, rotA);
-    s.pitch = lerp(s.pitch, pitchStep, rotA);
+    if (latencyCompensation && s.valid) {
+      const now = performance.now();
+      const dt = clamp((now - (spring.lastT || now)) / 1000, 1 / 120, 1 / 20);
+      spring.lastT = now;
+      s.cx = springScalar(s.cx, clampedAnchor.x, "vx", dt, 120, 17);
+      s.cy = springScalar(s.cy, clampedAnchor.y, "vy", dt, 120, 17);
+      s.radius = springScalar(s.radius, radiusStep, "vr", dt, 95, 16);
+      s.angle = springAngle(s.angle, angleStep, "va", dt, 115, 17);
+      s.yaw = springScalar(s.yaw, yawStep, "vyaw", dt, 105, 16);
+      s.pitch = springScalar(s.pitch, pitchStep, "vpitch", dt, 105, 16);
+    } else {
+      spring.lastT = performance.now();
+      s.cx = lerp(s.cx, clampedAnchor.x, posA);
+      s.cy = lerp(s.cy, clampedAnchor.y, posA);
+      s.radius = lerp(s.radius, radiusStep, scaleA);
+      s.angle = lerpAngle(s.angle, angleStep, rotA);
+      s.yaw = lerp(s.yaw, yawStep, rotA);
+      s.pitch = lerp(s.pitch, pitchStep, rotA);
+    }
     s.valid = true;
 
     // Smooth the color adjustments toward their configured targets so
@@ -514,7 +549,6 @@ export function createAiHeadRenderer({
     ctx.translate(s.cx, s.cy);
     ctx.rotate(s.angle);
     ctx.translate(calibration.offsetX + slideX, calibration.offsetY + slideY);
-    ctx.scale(xScale, yScale);
 
     const halfW = drawSize * 0.5;
     const halfH = (drawSize * ovalAspectY) * 0.5;
@@ -544,6 +578,8 @@ export function createAiHeadRenderer({
     motion.lastT = 0;
     motion.last = null;
     motion.vx = motion.vy = motion.vr = motion.va = motion.vyaw = motion.vpitch = 0;
+    spring.lastT = 0;
+    spring.vx = spring.vy = spring.vr = spring.va = spring.vyaw = spring.vpitch = 0;
     scratchFrameKey = -1;
     if (typeof fallback.reset === "function") fallback.reset();
   }
