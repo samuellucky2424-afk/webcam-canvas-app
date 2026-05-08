@@ -2,7 +2,7 @@
  * Avatar renderer.
  *
  * Consumes a skeleton rig (see `./skeleton.js`) and draws a stylized humanoid
- * AI avatar onto a 2D canvas context. The body is composed of filled polygons
+ * avatar onto a 2D canvas context. The body is composed of filled polygons
  * (torso trapezoid with chest/ab paneling), tapered limb segments, rounded
  * hands and feet, a neck cylinder, and a detailed head with hair, eyes,
  * brows and mouth.
@@ -424,7 +424,7 @@ function drawTorso(context, leftShoulder, rightShoulder, leftHip, rightHip, neck
  *
  * NOTE: head drawing now lives in `./head.js`. The avatar invokes whichever
  * head renderer was passed in (default, image, video, or canvas source) so
- * external face streams (e.g. AI-generated faces) can replace the head
+ * optional local texture sources can replace the head
  * without touching this module.
  */
 

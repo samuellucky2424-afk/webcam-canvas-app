@@ -2,9 +2,8 @@
  * Head rendering module.
  *
  * The avatar's head is drawn through a pluggable "head renderer" so it can be
- * swapped at runtime — for example, replaced by an external video stream
- * (live face) or a static image (AI-generated portrait) without touching the
- * body rendering pipeline.
+ * swapped at runtime with a static identity portrait or local texture canvas
+ * without touching the body rendering pipeline.
  *
  * All head renderers share the same interface:
  *
@@ -45,8 +44,13 @@ export function createDefaultHeadRenderer({ palette, style }) {
     const yaw = headPose?.yaw ?? 0;
     const pitch = headPose?.pitch ?? 0;
     const eyeOpen = headPose?.eyeOpen ?? 1;
-    const mouthOpen = headPose?.mouthOpen ?? 0;
+    const leftEyeOpen = headPose?.leftEyeOpen ?? eyeOpen;
+    const rightEyeOpen = headPose?.rightEyeOpen ?? eyeOpen;
+    const mouthOpen = Math.max(headPose?.mouthOpen ?? 0, (headPose?.jawOpen ?? 0) * 0.8);
     const smile = headPose?.smile ?? 0;
+    const browRaise = headPose?.browRaise ?? 0;
+    const eyeDirectionX = headPose?.eyeDirectionX ?? 0;
+    const eyeDirectionY = headPose?.eyeDirectionY ?? 0;
 
     context.save();
     context.translate(center.x, center.y);
@@ -114,7 +118,7 @@ export function createDefaultHeadRenderer({ palette, style }) {
     const eyeRadiusX = halfW * 0.16;
     const eyeRadiusY = halfH * 0.10;
 
-    const browY = eyeY - halfH * 0.18;
+    const browY = eyeY - halfH * (0.18 + browRaise * 0.1);
     context.strokeStyle = palette.brow;
     context.lineWidth = Math.max(radius * 0.045, 1.5);
     context.lineCap = "round";
@@ -133,9 +137,9 @@ export function createDefaultHeadRenderer({ palette, style }) {
     );
     context.stroke();
 
-    function drawEye(cx) {
+    function drawEye(cx, openAmount) {
       // Sclera (with closed-eye fallback when eyelids are shut).
-      if (eyeOpen <= 0.08) {
+      if (openAmount <= 0.08) {
         // Fully closed — draw a curved lash line.
         context.strokeStyle = palette.outline;
         context.lineWidth = Math.max(style.outlineWidth * 0.8, 1.4);
@@ -151,7 +155,7 @@ export function createDefaultHeadRenderer({ palette, style }) {
 
       // Eye opening height tracks blink amount (clamped to a minimum
       // squint so the iris stays readable above ~0.08).
-      const openY = eyeRadiusY * Math.max(eyeOpen, 0.15);
+      const openY = eyeRadiusY * Math.max(openAmount, 0.15);
 
       context.save();
       context.beginPath();
@@ -167,8 +171,8 @@ export function createDefaultHeadRenderer({ palette, style }) {
       );
 
       const irisR = eyeRadiusY * 0.85;
-      const gazeX = cx + yawShift + Math.sin(yaw) * eyeRadiusX * 0.4;
-      const gazeY = eyeY + Math.sin(pitch) * eyeRadiusY * 0.4;
+      const gazeX = cx + yawShift + eyeDirectionX * eyeRadiusX * 0.45;
+      const gazeY = eyeY + eyeDirectionY * eyeRadiusY * 0.5;
       context.fillStyle = palette.iris;
       context.beginPath();
       context.arc(gazeX, gazeY, irisR, 0, Math.PI * 2);
@@ -194,8 +198,8 @@ export function createDefaultHeadRenderer({ palette, style }) {
       context.ellipse(cx + yawShift, eyeY, eyeRadiusX, openY, 0, 0, Math.PI * 2);
       context.stroke();
     }
-    drawEye(-eyeOffsetX);
-    drawEye(eyeOffsetX);
+    drawEye(-eyeOffsetX, leftEyeOpen);
+    drawEye(eyeOffsetX, rightEyeOpen);
 
     // Nose.
     const noseTopY = eyeY + halfH * 0.05;
@@ -298,24 +302,20 @@ export function createDefaultHeadRenderer({ palette, style }) {
 // Sprite-based head renderer — accepts any drawable source (HTMLImageElement,
 // HTMLCanvasElement, HTMLVideoElement, ImageBitmap, OffscreenCanvas).
 //
-// This is the integration point for AI-generated face frames:
+// This is the integration point for optional head texture assets:
 //   - A static portrait → pass an HTMLImageElement.
-//   - A live face video → pass an HTMLVideoElement (e.g. a hidden <video>
-//     attached to a MediaStream from getUserMedia, an AI face filter, or a
-//     remote stream).
-//   - An off-screen canvas where another module paints AI face frames →
-//     pass that canvas. The avatar will resample it each frame.
+//   - A live local video → pass an HTMLVideoElement.
+//   - An off-screen canvas where another local module paints a texture.
 // ---------------------------------------------------------------------------
 
 const DEFAULT_SPRITE_OPTIONS = {
-  // Multiplier on the body-derived head radius. AI face crops are usually
-  // tighter than the avatar's geometric head, so 1.0 is a good default.
+  // Multiplier on the body-derived head radius.
   scale: 1.0,
   // Aspect ratio (width / height). 1 = square crop. Override for non-square
   // sources (e.g. 0.78 for portrait).
   aspect: 1.0,
   // Vertical offset along the head's local "up" axis, in radius units. Use
-  // this to nudge the AI face up/down to match the avatar's expected
+  // this to nudge a portrait up/down to match the avatar's expected
   // forehead/chin alignment.
   verticalOffset: 0,
   // Clip the sprite to an oval matching the head silhouette. Set false to
@@ -384,6 +384,27 @@ export function createSpriteHeadRenderer({ source, ...options } = {}) {
   return { draw, setSource };
 }
 
+export function createDynamicHeadRenderer({ palette, style } = {}) {
+  const fallback = createDefaultHeadRenderer({ palette, style });
+  const sprite = createSpriteHeadRenderer({ source: null, clipOval: true, scale: 1.08 });
+  let hasSource = false;
+
+  function setSource(source) {
+    hasSource = Boolean(source);
+    sprite.setSource(source);
+  }
+
+  function draw(context, frame) {
+    if (hasSource) {
+      sprite.draw(context, frame);
+      return;
+    }
+    fallback.draw(context, frame);
+  }
+
+  return { draw, setSource };
+}
+
 // ---------------------------------------------------------------------------
 // Factory dispatcher used by the avatar to pick a renderer from config.
 // ---------------------------------------------------------------------------
@@ -417,5 +438,5 @@ export function resolveHeadRenderer(descriptor, { palette, style }) {
     });
   }
 
-  return createDefaultHeadRenderer({ palette, style });
+  return createDynamicHeadRenderer({ palette, style });
 }

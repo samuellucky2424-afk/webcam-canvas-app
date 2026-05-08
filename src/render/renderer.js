@@ -177,9 +177,6 @@ export function createRenderer({
   context.imageSmoothingEnabled = false;
 
   const avatarEnabled = avatarConfig?.enabled !== false && Boolean(avatarConfig);
-  const overlayEnabled = !avatarEnabled || avatarConfig?.showOverlay !== false;
-  const handDebugEnabled = avatarConfig?.showHandDebug === true;
-  const faceDebugEnabled = avatarConfig?.showFaceDebug === true;
   const puppetConfig = avatarConfig?.puppet ?? null;
   const puppetEnabled = puppetConfig?.enabled === true && puppetConfig?.source;
   const avatarRenderer = avatarEnabled
@@ -321,6 +318,9 @@ export function createRenderer({
         videoHeight: video.videoHeight
       });
       const projected = assistPoseWristsFromHands(projectOverlay(rawOverlay, mapping));
+      const overlayEnabled = !avatarEnabled || avatarConfig?.showOverlay !== false;
+      const handDebugEnabled = avatarConfig?.showHandDebug === true;
+      const faceDebugEnabled = avatarConfig?.showFaceDebug === true;
 
       if (overlayEnabled) {
         drawPoseOverlay(context, projected, poseConfig);
@@ -384,6 +384,12 @@ export function createRenderer({
       puppetRenderer?.resetCalibration?.();
       headPoseEstimator?.reset();
       context.clearRect(0, 0, canvas.width, canvas.height);
+    },
+    setHeadSource(source) {
+      avatarRenderer?.setHeadSource?.(source);
+    },
+    setHeadRenderer(next) {
+      avatarRenderer?.setHeadRenderer?.(next);
     }
   };
 }

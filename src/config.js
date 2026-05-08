@@ -15,12 +15,12 @@ export const CAMERA_CONSTRAINTS = {
     facingMode: "user",
     width: { ideal: 640 },
     height: { ideal: 360 },
-    frameRate: { ideal: 30, max: 30 }
+    frameRate: { ideal: 30, max: 60 }
   }
 };
 
 export const RENDER_CONFIG = {
-  targetFps: 24,
+  targetFps: 30,
   renderFps: 60,
   minimumFps: 15,
   initialScale: lowEndCpu ? 0.75 : 1,
@@ -28,18 +28,18 @@ export const RENDER_CONFIG = {
   maxScale: 1,
   downscaleStep: 0.15,
   upscaleStep: 0.05,
-  upscaleThresholdFps: 20,
+  upscaleThresholdFps: 24,
   maxCanvasWidth: lowEndCpu ? 720 : 1280
 };
 
 export const POSE_TRACKER_CONFIG = {
   downshiftStep: 2,
   maxPoses: 1,
-  maxTargetFps: lowEndCpu ? 24 : 30,
+  maxTargetFps: lowEndCpu ? 30 : 60,
   minTargetFps: 10,
   modelAssetPath: poseModelPath,
-  recoveryFps: 24,
-  targetFps: lowEndCpu ? 18 : 30,
+  recoveryFps: 28,
+  targetFps: lowEndCpu ? 24 : 30,
   upshiftStep: 1,
   wasmPath: "/node_modules/@mediapipe/tasks-vision/wasm",
   minPoseDetectionConfidence: 0.5,
@@ -51,11 +51,16 @@ export const POSE_TRACKER_CONFIG = {
     minHandDetectionConfidence: 0.5,
     minHandPresenceConfidence: 0.5,
     minTrackingConfidence: 0.5,
-    // Run the hand tracker slightly slower than pose to keep the FPS floor
-    // safe on lower-end machines. Pose runs at `targetFps` above.
-    targetFps: lowEndCpu ? 12 : 15
+    targetFps: lowEndCpu ? 18 : 30
   },
-  face: null
+  face: {
+    modelAssetPath: faceModelPath,
+    numFaces: 1,
+    minFaceDetectionConfidence: 0.5,
+    minFacePresenceConfidence: 0.5,
+    minTrackingConfidence: 0.5,
+    targetFps: lowEndCpu ? 18 : 30
+  }
 };
 
 export const POSE_RENDER_CONFIG = {
@@ -83,29 +88,12 @@ export const POSE_RENDER_CONFIG = {
 
 export const AVATAR_CONFIG = {
   enabled: true,
-  showOverlay: false, // when avatar is on, hide the raw landmark overlay for a cleaner look
-  // Hand-tracking debug overlay — draws the 21 raw hand landmarks + bone
-  // connections on top of the avatar. Toggle on to verify hand tracking.
-  showHandDebug: true,
-  // Face-mesh debug overlay — draws the 468 face-mesh points + connections
-  // on top of the avatar. Toggle on to verify face tracking.
+  showOverlay: false,
+  showHandDebug: false,
   showFaceDebug: false,
   scaleSmoothing: 0.18,
   headPoseSmoothing: 0.25,
-  // Head source descriptor. Swap this at runtime to plug in an AI face.
-  //
-  //   { type: "default" }                        — drawn humanoid head (current)
-  //   { type: "image", source: HTMLImageElement, scale, aspect, verticalOffset, clipOval, ignoreHeadPose }
-  //   { type: "video", source: HTMLVideoElement, ... }
-  //   { type: "canvas", source: HTMLCanvasElement | OffscreenCanvas, ... }
-  //
-  // The avatar maintains body alignment automatically: the head sprite is
-  // centered on the rig's neck-to-head vector, scaled by the body-derived
-  // head radius, and rotated to follow spine + detected head roll.
   head: { type: "default" },
-  // Optional: when set, main.js loads this image at startup and pushes it
-  // into the avatar's head slot via setHeadSource. Useful for testing the
-  // sprite head pipeline without running the full AI face service.
   testHeadImage: null,
   style: {
     outlineWidth: lowEndCpu ? 2 : 2.5,
@@ -113,7 +101,6 @@ export const AVATAR_CONFIG = {
     minBoneConfidence: 0.15
   },
   palette: {
-    // AI-style cool suit with cyan accents.
     bodyBase: "#2a3550",
     bodyHighlight: "#566285",
     bodyShadow: "#161c2c",
@@ -133,95 +120,41 @@ export const AVATAR_CONFIG = {
   }
 };
 
-// AI face integration (LivePortrait Python sidecar). When `enabled` is true,
-// the avatar's head slot is swapped to the AI head renderer once the WS
-// becomes ready, and reverts to the local default head atomically on
-// disconnect / stale-frame timeout.
-export const AI_FACE_CONFIG = {
-  enabled: true,
-  url: "wss://osts5obpvv4kv5-8765.proxy.runpod.net/ws",
-  connectTimeoutMs: 3000,
-  reconnectDelaysMs: [1000, 2000, 5000],
-  targetFps: lowEndCpu ? 1.5 : 2,
-  jpegQuality: 0.45,
-  driverSize: 160,
-  outputSize: 160,
-  ultraRealtime: false,
-  ultraDriverSize: 128,
-  ultraOutputSize: 128,
-  ultraJpegQuality: 0.4,
-  latencyCompensation: true,
-  predictionMs: 90,
-  maxPredictionMs: 140,
-  motionSmoothingAlpha: 0.55,
-  velocitySmoothingAlpha: 0.35,
-  textureBlendMs: 90,
-  adaptiveSend: true,
-  posePositionThreshold: 0.018,
-  poseRotationThreshold: 0.07,
-  poseExpressionThreshold: 0.12,
-  maxPoseSilenceMs: 2200,
-  compactPose: true,
-  compactPoseFps: 12,
-  adaptiveQuality: true,
-  highRttMs: 500,
-  stableRttMs: 320,
-  qualityDownshiftFrames: 2,
-  qualityRestoreFrames: 8,
-  staleAfterMs: 45000,
-  maxRealtimeLatencyMs: 700,
-  slowPreviewLatencyMs: 2000,
-  slowPreviewIntervalMs: 120000,
-  // Sync buffer keeps the body lagged so it lines up with the AI face,
-  // which is delayed by network + GPU inference (~80–120 ms is typical).
-  // The buffer measures real round-trip latency from frame-id pin events
-  // and continuously eases `currentDelayMs` toward it (clamped to the
-  // [bufferMinDelayMs, bufferMaxDelayMs] band) for drift correction.
-  bufferDelayMs: 100,
-  bufferMinDelayMs: 80,
-  bufferMaxDelayMs: 120,
-  bufferLatencyAlpha: 0.2,
-  bufferDriftCorrectionPerSec: 50,
-  edgeFeatherPx: 5,
-  edgeFeatherFrac: 0.10,
-  scaleBoost: 1.18,
-  ovalAspectY: 1.18,
-  // Color matching — applied to the AI portrait so it blends with the
-  // avatar palette. Smoothed across frames for anti-flicker.
-  colorCorrect: true,
-  brightness: 1.00,
-  contrast: 1.05,
-  saturation: 0.90,
-  // Default tone tint matches AVATAR_CONFIG.palette.skinBase (#e8c19a).
-  toneTint: "rgba(232, 193, 154, 1.0)",
-  toneStrength: 0.18,
-  chinShadowStrength: 0.22,
-  rimShadowStrength: 0.18,
-  colorSmoothingAlpha: 0.08,
-  // Alignment & stability — see src/face/aiHeadRenderer.js for the full
-  // pipeline. `smoothingAlpha` is the per-frame blend (cur*alpha +
-  // prev*(1-alpha)) applied to anchor position, scale, rotation, yaw
-  // and pitch. `offsetX/Y` are head-local calibration nudges in pixels.
-  smoothingAlpha: 0.15,
-  offsetX: 0,
-  offsetY: 0,
-  yawWeight: 0.6,
-  pitchWeight: 0.6,
-  // When true, draws anchor point + bounding box + alignment cross over
-  // the AI face for visual debugging of drift/scale jitter. Can also be
-  // toggled at runtime via `window.__aiHead.setDebug(true)`.
-  debug: false
+export const SEMANTIC_STREAM_CONFIG = {
+  enabled: false,
+  url: "",
+  maxPacketsPerSecond: 24,
+  compact: true,
+  reconnectDelaysMs: [1000, 2500, 5000],
+  maxBufferedBytes: 16000,
+  smoothingAlpha: lowEndCpu ? 0.42 : 0.38,
+  deadzone: {
+    angleDeg: 0.35,
+    unit: 0.012,
+    point: 0.002
+  }
 };
 
-// Outbound WebRTC streaming of the rendered avatar canvas. Disabled by
-// default — set `enabled: true` and provide a WHIP-style signaling
-// `endpoint` to start publishing.
+export const CLOUD_ENHANCEMENT_CONFIG = {
+  enabled: false,
+  maxFps: 1
+};
+
+export const LIVEPORTRAIT_CONFIG = {
+  enabled: true,
+  baseUrl: "http://127.0.0.1:8765",
+  uploadPath: "/avatar/upload",
+  wsPath: "/ws/semantic",
+  maxPacketsPerSecond: 24,
+  connectAfterUpload: true,
+  reconnectDelaysMs: [1000, 2500, 5000],
+  maxBufferedBytes: 12000
+};
+
 export const STREAM_CONFIG = {
   enabled: false,
   endpoint: "",
-  targetFps: 30,
-  bitrateKbps: 2500,
-  preferCodec: "VP9"
+  targetFps: 30
 };
 
 export const THREE_CONFIG = {

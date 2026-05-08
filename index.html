@@ -21,41 +21,64 @@
 
     <div class="hud">
       <div class="hud-header">
-        <h1>Webcam Canvas Preview</h1>
+        <h1>Semantic Avatar Pipeline</h1>
         <p id="status" class="status" data-tone="working">Starting camera...</p>
+      </div>
+      <div class="pipeline" aria-live="polite">
+        <span id="stage-webcam" data-state="waiting">Webcam</span>
+        <span id="stage-landmarks" data-state="waiting">Landmarks</span>
+        <span id="stage-motion" data-state="waiting">Semantics</span>
+        <span id="stage-renderer" data-state="waiting">Renderer</span>
+        <span id="stage-virtual-camera" data-state="waiting">Virtual camera</span>
       </div>
       <div class="metrics" aria-live="polite">
         <span id="fps">0.0 FPS</span>
         <span id="scale">100% scale</span>
         <span id="resolution">640 x 480</span>
-        <span id="tracking-state">pose: - / hands: 0</span>
-        <span id="ai-ws-state" data-state="closed">AI WS: closed</span>
+        <span id="tracking-state">pose: - / hands: 0 / face: -</span>
+        <span id="semantic-ws-state" data-state="disabled">Semantic WS: disabled</span>
+        <span id="avatar-loaded" data-state="disabled">avatar: none</span>
+        <label class="metric-toggle">
+          <input id="landmark-toggle" type="checkbox">
+          <span>Landmarks</span>
+        </label>
       </div>
     </div>
 
-    <div id="sync-hud" class="sync-hud" hidden>
-      <strong>Sync</strong>
-      <span id="sync-mode">mode: -</span>
-      <span id="sync-delay">delay: -</span>
-      <span id="sync-latency">lat: -</span>
-      <span id="sync-offset">offset: -</span>
-      <span id="sync-interp">interp: -</span>
+    <div id="semantic-hud" class="semantic-hud" hidden>
+      <strong>Semantic stream</strong>
+      <span id="semantic-packet-size">packet: 0 B</span>
+      <span id="semantic-pps">pps: 0.0</span>
+      <span id="semantic-bandwidth">up: 0.00 KB/s</span>
+      <span id="semantic-rtt">rtt: -</span>
+      <span id="semantic-dropped">dropped: 0</span>
+      <span id="semantic-interp">render lag: -</span>
+      <span id="semantic-confidence">confidence: -</span>
+      <code id="semantic-sample">{}</code>
     </div>
 
-    <div id="ai-bridge" class="ai-bridge" hidden>
-      <strong>MediaPipe -> LivePortrait</strong>
-      <canvas id="ai-bridge-preview" width="160" height="160"></canvas>
-      <label class="ai-bridge-toggle">
-        <input id="ai-ultra-mode" type="checkbox">
-        <span>Ultra RT</span>
+    <div id="liveportrait-panel" class="liveportrait-panel">
+      <strong>LivePortrait</strong>
+      <div id="avatar-dropzone" class="avatar-dropzone" data-dragging="false">
+        <canvas id="liveportrait-preview" width="160" height="160"></canvas>
+        <span>Drop portrait here</span>
+        <small>JPG, PNG, WebP / 10 MB max</small>
+      </div>
+      <input id="portrait-upload" type="file" accept="image/png,image/jpeg,image/webp" hidden>
+      <button id="portrait-pick" class="file-button" type="button">Choose portrait</button>
+      <label class="server-field">
+        <span>Server</span>
+        <input id="liveportrait-base-url" type="url" spellcheck="false">
       </label>
-      <span id="ai-bridge-source">source: -</span>
-      <span id="ai-bridge-state">state: closed</span>
-      <span id="ai-bridge-sent">sent: 0</span>
-      <span id="ai-bridge-received">received: 0</span>
-      <span id="ai-bridge-bitrate">net: -</span>
-      <span id="ai-bridge-latency">latency: -</span>
-      <span id="ai-bridge-last">last: -</span>
+      <div class="liveportrait-actions">
+        <button id="liveportrait-connect" type="button">Connect</button>
+        <button id="liveportrait-disconnect" type="button">Stop</button>
+      </div>
+      <span id="liveportrait-state" data-state="closed">state: closed</span>
+      <span id="liveportrait-rate">packets: 0.0/s / frames: 0.0/s</span>
+      <span id="liveportrait-net">net: 0.0 / 0.0 KB/s</span>
+      <span id="liveportrait-latency">rtt: -</span>
+      <span id="liveportrait-source">source: none</span>
     </div>
 
     <script type="module" src="./src/main.js"></script>

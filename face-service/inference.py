@@ -1,10 +1,10 @@
 """
 LivePortrait inference wrapper.
 
-Loads a source avatar image once, then animates it frame-by-frame using a
-stream of driving frames (the user's webcam). Each call to `animate(frame)`
-returns a single rendered RGB frame matching the avatar identity but driven
-by the expression/pose of the input frame.
+Loads a source avatar image once and caches the appearance tensors used by
+the semantic renderer. The legacy `animate(frame)` helper is kept for local
+experiments, but the production server uses semantic controls instead of
+browser webcam frames.
 
 This module isolates the LivePortrait dependency so the rest of the service
 (WebSocket transport, preprocessing, FPS pacing) doesn't need to know about
@@ -72,7 +72,7 @@ class LivePortraitEngine:
     Lifecycle:
         engine = LivePortraitEngine(config)
         engine.load_source(image_path_or_array)   # once, at start-up
-        out = engine.animate(driving_bgr_frame)   # per frame
+        out = engine.animate(driving_bgr_frame)   # optional local experiment
     """
 
     def __init__(self, config: EngineConfig):
@@ -228,7 +228,7 @@ class LivePortraitEngine:
     @torch.inference_mode()
     def animate(self, driving_bgr: np.ndarray) -> np.ndarray:
         """
-        Animate the cached source using one driving frame.
+        Animate the cached source using one local driving frame.
 
         :param driving_bgr: HxWx3 uint8 BGR (OpenCV convention).
         :returns: HxWx3 uint8 BGR animated face crop, sized
@@ -239,7 +239,7 @@ class LivePortraitEngine:
 
         size = self.config.inference_size
         # Resize once on the CPU before handing to the model. Bilinear is
-        # plenty for face driving frames and avoids expensive INTER_AREA on
+        # plenty for local face-driving experiments and avoids expensive INTER_AREA on
         # the hot path.
         if driving_bgr.shape[0] != size or driving_bgr.shape[1] != size:
             driving_bgr = cv2.resize(driving_bgr, (size, size), interpolation=cv2.INTER_LINEAR)

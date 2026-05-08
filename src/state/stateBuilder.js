@@ -2,8 +2,8 @@
  * Unified per-frame state builder.
  *
  * Composes the outputs of the three trackers (pose, hands, face) and the
- * head-pose estimator into a single immutable `state` object that downstream
- * stages (body rig, AI face client, composer, stream encoder) all read from.
+ * head-pose estimator into a single per-frame `state` object that downstream
+ * stages (body rig, semantic encoder, local renderer) all read from.
  *
  * Tracking is NEVER duplicated here — this module reads what the trackers
  * have already produced. It does no MediaPipe work of its own.
@@ -12,10 +12,15 @@
  *
  *   {
  *     timestamp: number,             // performance.now() at build time
- *     frameId:   number,              // monotonic id (driver→server pairing)
+ *     frameId:   number,              // monotonic id for semantic packets
  *     skeleton:  {...},               // body joints (canvas-space if mapped)
  *     hands:     [{landmarks, ...}],  // up to 2 hands
- *     headPose:  { roll, yaw, pitch, eyeOpen, mouthOpen, smile, confidence },
+ *     headPose:  {
+ *       roll, yaw, pitch,
+ *       eyeOpen, leftEyeOpen, rightEyeOpen,
+ *       mouthOpen, jawOpen, smile, browRaise,
+ *       eyeDirectionX, eyeDirectionY, confidence
+ *     },
  *     faceSignals: {
  *       blink:            number,     // 1 - eyeOpen, clamped 0..1
  *       mouthOpen:        number,     // 0..1
@@ -41,8 +46,14 @@ export function createStateBuilder() {
   function build(overlay, headPose) {
     const now = performance.now();
     const eyeOpen = headPose?.eyeOpen ?? 1;
+    const leftEyeOpen = headPose?.leftEyeOpen ?? eyeOpen;
+    const rightEyeOpen = headPose?.rightEyeOpen ?? eyeOpen;
     const mouthOpen = headPose?.mouthOpen ?? 0;
+    const jawOpen = headPose?.jawOpen ?? mouthOpen;
     const smile = headPose?.smile ?? 0;
+    const browRaise = headPose?.browRaise ?? 0;
+    const eyeDirectionX = headPose?.eyeDirectionX ?? 0;
+    const eyeDirectionY = headPose?.eyeDirectionY ?? 0;
     const hasFace = Array.isArray(overlay?.faces) && overlay.faces.length > 0;
 
     lastState = {
@@ -57,19 +68,33 @@ export function createStateBuilder() {
             yaw: headPose.yaw ?? 0,
             pitch: headPose.pitch ?? 0,
             eyeOpen,
+            leftEyeOpen,
+            rightEyeOpen,
             mouthOpen,
+            jawOpen,
             smile,
+            browRaise,
+            eyeDirectionX,
+            eyeDirectionY,
             confidence: headPose.confidence ?? 0
           }
         : null,
       faceSignals: {
         blink: Math.min(Math.max(1 - eyeOpen, 0), 1),
+        blinkLeft: Math.min(Math.max(1 - leftEyeOpen, 0), 1),
+        blinkRight: Math.min(Math.max(1 - rightEyeOpen, 0), 1),
         mouthOpen,
+        jawOpen,
+        browRaise,
+        eyeDirection: { x: eyeDirectionX, y: eyeDirectionY },
         expressionValues: {
           smile,
           yaw: headPose?.yaw ?? 0,
           pitch: headPose?.pitch ?? 0,
-          roll: headPose?.roll ?? 0
+          roll: headPose?.roll ?? 0,
+          browRaise,
+          eyeDirectionX,
+          eyeDirectionY
         }
       },
       hasFace

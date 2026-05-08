@@ -19,6 +19,7 @@ pillow>=10.0
 fastapi>=0.110
 uvicorn[standard]>=0.29
 websockets>=12.0
+python-multipart>=0.0.9
 
 # Used to fetch LivePortrait checkpoints on Windows (no bash required).
 huggingface_hub>=0.23
