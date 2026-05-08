@@ -43,7 +43,11 @@ class AvatarManager:
             "device": str(self.driver.device),
         }
 
-    async def render(self, motion: MotionState, avatar_id: str | None = None):
+    @property
+    def has_motion(self) -> bool:
+        return self.driver.has_motion
+
+    async def render(self, motion: MotionState | None, avatar_id: str | None = None):
         async with self.lock:
             if avatar_id and self.current_avatar_id and avatar_id != self.current_avatar_id:
                 raise RuntimeError("Requested avatar is not loaded on this worker.")
@@ -59,4 +63,5 @@ class AvatarManager:
             "gpu_memory_mb": self.driver.gpu_memory_mb(),
             "last_upload_at": self.last_upload_at,
             "last_render_at": self.last_render_at,
+            "semantic_mapper": self.driver.semantic_metrics(),
         }

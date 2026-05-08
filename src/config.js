@@ -142,7 +142,7 @@ export const CLOUD_ENHANCEMENT_CONFIG = {
 
 export const LIVEPORTRAIT_CONFIG = {
   enabled: true,
-  baseUrl: "http://127.0.0.1:8765",
+  baseUrl: "https://7rv82kmoo4v93t-8765.proxy.runpod.net",
   uploadPath: "/avatar/upload",
   wsPath: "/ws/semantic",
   maxPacketsPerSecond: 24,

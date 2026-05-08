@@ -81,6 +81,7 @@ def build_app(manager: AvatarManager, target_fps: int, jpeg_quality: int) -> Fas
         await websocket.accept()
         latest: dict[str, MotionState | None] = {"motion": None}
         stop = asyncio.Event()
+        send_lock = asyncio.Lock()
         last_send = 0.0
         session_drops = 0
 
@@ -102,7 +103,8 @@ def build_app(manager: AvatarManager, target_fps: int, jpeg_quality: int) -> Fas
                     except json.JSONDecodeError:
                         continue
                     if packet.get("type") == "ping":
-                        await websocket.send_text(json.dumps({"type": "pong", "t": packet.get("t")}))
+                        async with send_lock:
+                            await websocket.send_text(json.dumps({"type": "pong", "t": packet.get("t")}))
                         continue
                     motion = decoder.decode(packet)
                     if latest["motion"] is not None:
@@ -127,17 +129,18 @@ def build_app(manager: AvatarManager, target_fps: int, jpeg_quality: int) -> Fas
                         await asyncio.sleep(wait)
 
                     motion = latest["motion"]
-                    if motion is None:
+                    latest["motion"] = None
+                    if motion is None and not manager.has_motion:
                         await asyncio.sleep(0.004)
                         continue
-                    latest["motion"] = None
 
                     try:
                         frame = await manager.render(motion, avatar_id)
                         ok, encoded = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), jpeg_quality])
                         if not ok:
                             continue
-                        await websocket.send_bytes(encoded.tobytes())
+                        async with send_lock:
+                            await websocket.send_bytes(encoded.tobytes())
                     except (WebSocketDisconnect, RuntimeError):
                         break
                     except Exception:  # noqa: BLE001
@@ -156,15 +159,44 @@ def build_app(manager: AvatarManager, target_fps: int, jpeg_quality: int) -> Fas
                 while not stop.is_set():
                     await asyncio.sleep(1.0)
                     rates = _refresh_rates(metrics)
-                    gpu = manager.metrics()["gpu_memory_mb"]
+                    manager_metrics = manager.metrics()
+                    gpu = manager_metrics["gpu_memory_mb"]
+                    mapper_metrics = manager_metrics.get("semantic_mapper", {})
+                    controls = mapper_metrics.get("controls", {})
+                    payload = {
+                        "type": "metrics",
+                        "semantic_fps": rates["packet_rate"],
+                        "render_fps": rates["inference_fps"],
+                        "queue_size": 1 if latest["motion"] is not None else 0,
+                        "dropped_packets": metrics["dropped_packets"],
+                        "render_ms": round(manager.driver.last_render_ms, 2),
+                        "smoothing_alpha": mapper_metrics.get("smoothing_alpha"),
+                        "expression_alpha": mapper_metrics.get("expression_alpha"),
+                        "yaw": controls.get("yaw"),
+                        "pitch": controls.get("pitch"),
+                        "roll": controls.get("roll"),
+                        "blink_left": controls.get("blink_left"),
+                        "blink_right": controls.get("blink_right"),
+                        "mouth_open": controls.get("mouth_open"),
+                        "last_ws_latency_ms": rates["last_ws_latency_ms"],
+                    }
+                    try:
+                        async with send_lock:
+                            await websocket.send_text(json.dumps(payload, separators=(",", ":")))
+                    except (WebSocketDisconnect, RuntimeError):
+                        break
                     logger.info(
-                        "semantic ws packets=%.1f/s render=%.1f/s dropped=%d render_ms=%.1f ws_latency=%s gpu=%sMB",
+                        "semantic ws packets=%.1f/s render=%.1f/s queue=%d dropped=%d render_ms=%.1f ws_latency=%s gpu=%sMB pose=(%.1f %.1f %.1f)",
                         rates["packet_rate"],
                         rates["inference_fps"],
+                        payload["queue_size"],
                         metrics["dropped_packets"],
                         manager.driver.last_render_ms,
                         "-" if metrics["last_ws_latency_ms"] is None else f"{metrics['last_ws_latency_ms']:.0f}ms",
                         gpu,
+                        float(controls.get("yaw") or 0.0),
+                        float(controls.get("pitch") or 0.0),
+                        float(controls.get("roll") or 0.0),
                     )
             finally:
                 stop.set()

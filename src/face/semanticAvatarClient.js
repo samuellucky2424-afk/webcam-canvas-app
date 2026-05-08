@@ -57,6 +57,7 @@ export function createSemanticAvatarClient({
   let lastPacketBytes = 0;
   let lastPacket = "";
   let lastError = "";
+  let serverMetrics = {};
 
   const minIntervalMs = 1000 / clamp(maxPacketsPerSecond, 1, 30);
   const backoffDelays =
@@ -269,8 +270,10 @@ export function createSemanticAvatarClient({
           rttMs = performance.now() - pendingPingT;
           pendingPingT = 0;
         }
-        if (message?.type === "metrics" && Number.isFinite(message.rtt_ms)) {
-          rttMs = message.rtt_ms;
+        if (message?.type === "metrics") {
+          serverMetrics = { ...serverMetrics, ...message };
+          if (Number.isFinite(message.rtt_ms)) rttMs = message.rtt_ms;
+          if (Number.isFinite(message.last_ws_latency_ms)) rttMs = message.last_ws_latency_ms;
         }
         if (message?.error) lastError = String(message.error);
       } catch {
@@ -321,6 +324,7 @@ export function createSemanticAvatarClient({
       lastPacket,
       rttMs,
       lastError,
+      serverMetrics,
       msSinceReceive: lastRecvT ? performance.now() - lastRecvT : null,
       bufferedAmount: ws?.bufferedAmount ?? 0
     };

@@ -229,8 +229,9 @@ function attachAvatarUploadPanel() {
   setInterval(() => {
     if (!avatarClient) return;
     const stats = avatarClient.getStats();
+    const server = stats.serverMetrics ?? {};
     if (livePortraitRateLabel) {
-      livePortraitRateLabel.textContent = `packets: ${stats.sentPps.toFixed(1)}/s / frames: ${stats.receivedFps.toFixed(1)}/s`;
+      livePortraitRateLabel.textContent = `packets: ${(server.semantic_fps ?? stats.sentPps).toFixed(1)}/s / frames: ${(server.render_fps ?? stats.receivedFps).toFixed(1)}/s`;
     }
     if (livePortraitNetLabel) {
       livePortraitNetLabel.textContent = `net: ${stats.uploadKBps.toFixed(2)} / ${stats.downloadKBps.toFixed(1)} KB/s`;
@@ -251,6 +252,10 @@ function attachSemanticHud(getSemantic) {
   const bandwidth = root.querySelector("#semantic-bandwidth");
   const rtt = root.querySelector("#semantic-rtt");
   const dropped = root.querySelector("#semantic-dropped");
+  const renderFps = root.querySelector("#semantic-render-fps");
+  const queue = root.querySelector("#semantic-queue");
+  const smoothing = root.querySelector("#semantic-smoothing");
+  const rotation = root.querySelector("#semantic-rotation");
   const interp = root.querySelector("#semantic-interp");
   const confidence = root.querySelector("#semantic-confidence");
   const sample = root.querySelector("#semantic-sample");
@@ -258,14 +263,28 @@ function attachSemanticHud(getSemantic) {
   root.hidden = false;
   setInterval(() => {
     const stats = avatarClient?.getStats?.() ?? {};
+    const server = stats.serverMetrics ?? {};
     const semantic = getSemantic?.();
     const latencyMs = semantic?.timestamp ? Math.max(0, performance.now() - semantic.timestamp) : null;
+    const yaw = Number.isFinite(server.yaw) ? server.yaw : semantic?.yaw;
+    const pitch = Number.isFinite(server.pitch) ? server.pitch : semantic?.pitch;
+    const roll = Number.isFinite(server.roll) ? server.roll : semantic?.roll;
 
     packet.textContent = `packet: ${stats.lastPacketBytes ?? 0} B`;
-    pps.textContent = `pps: ${(stats.sentPps ?? 0).toFixed(1)}`;
+    pps.textContent = `pps: ${(server.semantic_fps ?? stats.sentPps ?? 0).toFixed(1)}`;
     bandwidth.textContent = `up: ${(stats.uploadKBps ?? 0).toFixed(2)} KB/s`;
     rtt.textContent = `rtt: ${stats.rttMs == null ? "-" : `${stats.rttMs.toFixed(0)} ms`}`;
-    dropped.textContent = `dropped: ${stats.droppedPackets ?? 0}`;
+    dropped.textContent = `dropped: ${server.dropped_packets ?? stats.droppedPackets ?? 0}`;
+    if (renderFps) renderFps.textContent = `render fps: ${(server.render_fps ?? stats.receivedFps ?? 0).toFixed(1)}`;
+    if (queue) queue.textContent = `queue: ${server.queue_size ?? 0}`;
+    if (smoothing) smoothing.textContent = `smoothing: ${server.smoothing_alpha == null ? "-" : Number(server.smoothing_alpha).toFixed(2)}`;
+    if (rotation) {
+      rotation.textContent = `y/p/r: ${
+        [yaw, pitch, roll].every(Number.isFinite)
+          ? `${yaw.toFixed(1)} / ${pitch.toFixed(1)} / ${roll.toFixed(1)}`
+          : "-"
+      }`;
+    }
     interp.textContent = `render lag: ${latencyMs == null ? "-" : `${latencyMs.toFixed(1)} ms`}`;
     confidence.textContent = `confidence: ${semantic ? semantic.confidence.toFixed(2) : "-"}`;
     if (sample) sample.textContent = stats.lastPacket || "{}";
